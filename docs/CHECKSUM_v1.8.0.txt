@@ -1,0 +1,5 @@
+﻿文件：工程表清理助手_v1.8.0.xlam
+SHA-256：eb44801c740ee9be8bd7a341b5ebe7992e3c2c8357f8777d7bd5cfa6a2f4c5b9
+JavaScript语法：通过
+CustomUI回调：通过
+XLAM回读：通过

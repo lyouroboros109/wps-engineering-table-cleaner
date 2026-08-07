@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui">
+  <ribbon startFromScratch="false"><tabs>
+    <tab id="tabEngineeringTableCleaner" label="工程表清理" insertBeforeMso="TabDeveloper">
+      <group id="grpBlankRows" label="行清理">
+        <menu id="menuDeleteBlankRows" label="删除完全空白行">
+          <button id="btnDeleteBlankCurrent" label="当前工作表" onAction="RibbonDeleteBlankCurrent"/>
+          <button id="btnDeleteBlankWorkbook" label="整个工作簿" onAction="RibbonDeleteBlankWorkbook"/>
+        </menu>
+        <button id="btnDeleteSelectedBlankRows" label="删除所选空白格所在行" onAction="RibbonDeleteSelectedBlankRows"/>
+        <menu id="menuBlankColumnDirect" label="按指定列为空删行">
+          <button id="btnBlankColumnCurrent" label="当前工作表" onAction="RibbonBuildPreviewCurrent"/>
+          <button id="btnBlankColumnWorkbook" label="整个工作簿" onAction="RibbonBuildPreviewWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpPageCleanup" label="尾页与边界">
+        <menu id="menuCleanupOrphan" label="清理短尾页表头（可选中）">
+          <button id="btnCleanupOrphanCurrent" label="当前工作表／按选择" onAction="RibbonCleanupOrphanCurrent"/>
+          <button id="btnCleanupOrphanWorkbook" label="整个工作簿" onAction="RibbonCleanupOrphanWorkbook"/>
+        </menu>
+        <menu id="menuAlignBottom" label="打印范围与分页线">
+          <button id="btnAlignBottomCurrent" label="自动重建：当前工作表" onAction="RibbonAlignBottomCurrent"/>
+          <button id="btnAlignBottomWorkbook" label="自动重建：整个工作簿" onAction="RibbonAlignBottomWorkbook"/>
+          <button id="btnManualPageBreakCurrent" label="允许手动拖动：当前工作表" onAction="RibbonManualPageBreakCurrent"/>
+          <button id="btnManualPageBreakWorkbook" label="允许手动拖动：整个工作簿" onAction="RibbonManualPageBreakWorkbook"/>
+        </menu>
+        <menu id="menuPageWidth" label="调整右侧分页线">
+          <button id="btnPrintWideCurrent" label="当前工作表" onAction="RibbonPrintWideCurrent"/>
+          <button id="btnPrintWideWorkbook" label="整个工作簿" onAction="RibbonPrintWideWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpPdfCheck" label="PDF检查">
+        <menu id="menuDetectPdfRisks" label="PDF文字/打印风险检测">
+          <button id="btnDetectPdfCurrent" label="当前工作表" onAction="RibbonDetectPdfCurrent"/>
+          <button id="btnDetectPdfWorkbook" label="整个工作簿" onAction="RibbonDetectPdfWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpWorkbookView" label="视图">
+        <button id="btnAllPageBreakPreview" label="全部分页预览" onAction="RibbonAllPageBreakPreview"/>
+        <button id="btnAllNormalView" label="全部普通视图" onAction="RibbonAllNormalView"/>
+      </group>
+      <group id="grpFindDelete" label="文字内容">
+        <menu id="menuFindDuplicates" label="查找并清空文字">
+          <button id="btnFindDuplicatesCurrent" label="当前工作表" onAction="RibbonFindDuplicatesCurrent"/>
+          <button id="btnFindDuplicatesWorkbook" label="整个工作簿" onAction="RibbonFindDuplicatesWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpColumnsSheets" label="列与工作表">
+        <menu id="menuDeleteColumns" label="删除多余列并保持总宽">
+          <button id="btnDeleteColumnsCurrent" label="当前表删除所选列" onAction="RibbonDeleteColumnsCurrent"/>
+          <button id="btnDeleteColumnsWorkbook" label="整个工作簿删除同列" onAction="RibbonDeleteColumnsWorkbook"/>
+          <button id="btnDeleteColumnsInput" label="输入列号删除…" onAction="RibbonDeleteColumnsInput"/>
+        </menu>
+        <button id="btnBatchDeleteWorksheets" label="批量删除工作表" onAction="RibbonBatchDeleteWorksheets"/>
+      </group>
+      <group id="grpTableBorders" label="表格线">
+        <menu id="menuNormalizeBorders" label="统一外框/内部线宽">
+          <button id="btnNormalizeBordersCurrent" label="当前工作表" onAction="RibbonNormalizeBordersCurrent"/>
+          <button id="btnNormalizeBordersWorkbook" label="整个工作簿" onAction="RibbonNormalizeBordersWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpNumbering" label="序号顺位">
+        <menu id="menuRenumberChinese" label="中文大项（同名同号）">
+          <button id="btnRenumberChineseCurrent" label="当前工作表" onAction="RibbonRenumberChineseCurrent"/>
+          <button id="btnRenumberChineseWorkbook" label="整个工作簿" onAction="RibbonRenumberChineseWorkbook"/>
+        </menu>
+        <menu id="menuRenumberNumeric" label="数字序号（从1开始）">
+          <button id="btnRenumberNumericCurrent" label="当前工作表" onAction="RibbonRenumberNumericCurrent"/>
+          <button id="btnRenumberNumericWorkbook" label="整个工作簿" onAction="RibbonRenumberNumericWorkbook"/>
+        </menu>
+      </group>
+      <group id="grpUndo" label="撤回">
+        <button id="btnUndoLastOperation" label="撤回上一步" onAction="RibbonUndoLastOperation"/>
+        <button id="btnClearUndoPoint" label="清除撤回点" onAction="RibbonClearUndoPoint"/>
+      </group>
+      <group id="grpHelp" label="说明"><button id="btnCleanerHelp" label="使用说明" onAction="RibbonShowHelp"/></group>
+    </tab>
+  </tabs></ribbon>
+</customUI>

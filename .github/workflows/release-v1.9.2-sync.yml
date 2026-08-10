@@ -18,7 +18,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .release_tmp/js_*.b64 | base64 -d > src/EngineeringTableCleaner.js
+          cat .release_tmp/js_gz_*.b64 | base64 -d | gzip -d > src/EngineeringTableCleaner.js
           mkdir -p release
           cat .release_tmp/xlam_*.b64 | base64 -d > 'release/工程表清理助手_v1.9.2.xlam'
           echo '1e5d253d1bfe8b0b2a35fc14f525a2082a3541a3fff9e07e064350e33fab4867  release/工程表清理助手_v1.9.2.xlam' | sha256sum -c -

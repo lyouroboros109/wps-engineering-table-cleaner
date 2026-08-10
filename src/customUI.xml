@@ -21,18 +21,36 @@
         <menu id="menuAlignBottom" label="打印范围与分页线">
           <button id="btnAlignBottomCurrent" label="自动重建：当前工作表" onAction="RibbonAlignBottomCurrent"/>
           <button id="btnAlignBottomWorkbook" label="自动重建：整个工作簿" onAction="RibbonAlignBottomWorkbook"/>
-          <button id="btnManualPageBreakCurrent" label="允许手动拖动：当前工作表" onAction="RibbonManualPageBreakCurrent"/>
-          <button id="btnManualPageBreakWorkbook" label="允许手动拖动：整个工作簿" onAction="RibbonManualPageBreakWorkbook"/>
         </menu>
         <menu id="menuPageWidth" label="调整右侧分页线">
           <button id="btnPrintWideCurrent" label="当前工作表" onAction="RibbonPrintWideCurrent"/>
           <button id="btnPrintWideWorkbook" label="整个工作簿" onAction="RibbonPrintWideWorkbook"/>
         </menu>
       </group>
-      <group id="grpPdfCheck" label="PDF检查">
-        <menu id="menuDetectPdfRisks" label="PDF文字/打印风险检测">
+      <group id="grpAudit" label="诊断中心">
+        <menu id="menuEngineeringAudit" label="工程表体检">
+          <button id="btnAuditCurrent" label="当前工作表" onAction="RibbonAuditCurrent"/>
+          <button id="btnAuditWorkbook" label="整个工作簿" onAction="RibbonAuditWorkbook"/>
+        </menu>
+        <menu id="menuPageDiagnostic" label="分页诊断">
+          <button id="btnPageDiagnosticCurrent" label="当前工作表" onAction="RibbonPageDiagnosticCurrent"/>
+          <button id="btnPageDiagnosticWorkbook" label="整个工作簿" onAction="RibbonPageDiagnosticWorkbook"/>
+        </menu>
+        <menu id="menuPdfDiagnostic" label="PDF风险">
           <button id="btnDetectPdfCurrent" label="当前工作表" onAction="RibbonDetectPdfCurrent"/>
           <button id="btnDetectPdfWorkbook" label="整个工作簿" onAction="RibbonDetectPdfWorkbook"/>
+        </menu>
+        <menu id="menuBorderDiagnostic" label="表格线宽诊断">
+          <button id="btnBorderDiagnosticCurrent" label="当前工作表" onAction="RibbonBorderDiagnosticCurrent"/>
+          <button id="btnBorderDiagnosticWorkbook" label="整个工作簿" onAction="RibbonBorderDiagnosticWorkbook"/>
+        </menu>
+        <menu id="menuNumberingDiagnostic" label="序号层级诊断">
+          <button id="btnNumberingDiagnosticCurrent" label="当前工作表" onAction="RibbonNumberingDiagnosticCurrent"/>
+          <button id="btnNumberingDiagnosticWorkbook" label="整个工作簿" onAction="RibbonNumberingDiagnosticWorkbook"/>
+        </menu>
+        <menu id="menuReportActions" label="报告处理">
+          <button id="btnOpenRecentReport" label="打开最近报告" onAction="RibbonOpenRecentReport"/>
+          <button id="btnDeletePluginReports" label="删除插件报告表" onAction="RibbonDeletePluginReports"/>
         </menu>
       </group>
       <group id="grpWorkbookView" label="视图">
@@ -54,7 +72,7 @@
         <button id="btnBatchDeleteWorksheets" label="批量删除工作表" onAction="RibbonBatchDeleteWorksheets"/>
       </group>
       <group id="grpTableBorders" label="表格线">
-        <menu id="menuNormalizeBorders" label="统一外框/内部线宽">
+        <menu id="menuNormalizeBorders" label="统一线宽（保守）">
           <button id="btnNormalizeBordersCurrent" label="当前工作表" onAction="RibbonNormalizeBordersCurrent"/>
           <button id="btnNormalizeBordersWorkbook" label="整个工作簿" onAction="RibbonNormalizeBordersWorkbook"/>
         </menu>
@@ -64,7 +82,7 @@
           <button id="btnRenumberChineseCurrent" label="当前工作表" onAction="RibbonRenumberChineseCurrent"/>
           <button id="btnRenumberChineseWorkbook" label="整个工作簿" onAction="RibbonRenumberChineseWorkbook"/>
         </menu>
-        <menu id="menuRenumberNumeric" label="数字序号（从1开始）">
+        <menu id="menuRenumberNumeric" label="数字序号（智能层级）">
           <button id="btnRenumberNumericCurrent" label="当前工作表" onAction="RibbonRenumberNumericCurrent"/>
           <button id="btnRenumberNumericWorkbook" label="整个工作簿" onAction="RibbonRenumberNumericWorkbook"/>
         </menu>

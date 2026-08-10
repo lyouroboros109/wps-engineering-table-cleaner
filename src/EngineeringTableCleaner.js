@@ -1,5 +1,5 @@
-/**
- * WPS 工程表清理助手 v1.8.0
+﻿/**
+ * WPS 工程表清理助手 v1.9.2
  * - 支持当前工作表 / 整个工作簿
  * - 支持按指定列为空直接删行，并兼容纵向合并区域缩短重建
  * - 支持跨工作表精确查找并清空相同文字内容，不删除行列
@@ -12,7 +12,46 @@
  * - 删除前在当前WPS中实际自检多种删行接口，只使用内容和合并结构均真实上移的方法
  * - 支持按实际表格边界重建打印区域与水平分页线
  * - 支持PDF导出文字截断、打印范围遗漏和分页穿越合并单元格检测
+ * - 支持生成工程表体检报告，并可一键删除插件生成的报告表
+ * - v1.8.8：整本模式使用Fresh ActiveSheet + 自动计算刷新，并修复尾页仅剩合计/1~2行的孤页问题
  */
+
+
+function 工程表清理_裁剪弹窗文字(value) {
+    var text = value === null || value === undefined ? "" : String(value);
+    /*
+     * WPS MsgBox 不提供滚动条。内容过多时按钮会被挤出屏幕。
+     * 所有 MsgBox 统一限制正文高度：优先保留开头、结尾（尤其“是否继续”），
+     * 中间明细自动省略。详细批量结果应进入报告表，而不是塞进弹窗。
+     */
+    var maxChars = 620;
+    var maxLines = 14;
+    var lines = text.split(/\r?\n/);
+    var clipped = text;
+
+    if (lines.length > maxLines) {
+        var headCount = 9;
+        var tailCount = 3;
+        clipped = lines.slice(0, headCount).join("\n") +
+            "\n……（中间内容较多，已省略）……\n" +
+            lines.slice(Math.max(headCount, lines.length - tailCount)).join("\n");
+    }
+
+    if (clipped.length > maxChars) {
+        var tail = clipped.slice(-150);
+        clipped = clipped.slice(0, maxChars - 190) +
+            "\n……（内容较多，已省略）……\n" + tail;
+    }
+    return clipped;
+}
+
+function 工程表清理_安全MsgBox(message, buttons, title) {
+    return MsgBox(
+        工程表清理_裁剪弹窗文字(message),
+        buttons,
+        title
+    );
+}
 
 function 工程表清理_快速模式开始(label) {
     var state = {
@@ -25,20 +64,43 @@ function 工程表清理_快速模式开始(label) {
     try { state.enableEvents = Application.EnableEvents; } catch (e2) {}
     try { state.calculation = Application.Calculation; } catch (e3) {}
     try { state.statusBar = Application.StatusBar; } catch (e4) {}
-    try { Application.ScreenUpdating = false; } catch (e5) {}
-    try { Application.EnableEvents = false; } catch (e6) {}
-    try { Application.Calculation = -4135; } catch (e7) {}
-    try { Application.StatusBar = label || "工程表清理助手正在处理…"; } catch (e8) {}
+
+    /*
+     * v1.8.4：
+     * 不再在宏刚启动时全局把 ScreenUpdating 关闭。
+     * WPS 在功能区按钮 + 模态 InputBox/MsgBox + 快速切表的组合下，
+     * 偶发会把主窗口丢到后台，让其它应用抢到前台。
+     * 保留事件/计算优化，但让 WPS 窗口持续可见；确实需要刷新分页缓存的
+     * 整本打印重建逻辑仍会显式控制活动表和分页状态。
+     */
+    try { Application.EnableEvents = false; } catch (e5) {}
+    try { Application.Calculation = -4135; } catch (e6) {}
+    try { Application.StatusBar = label || "工程表清理助手正在处理…"; } catch (e7) {}
     return state;
 }
 
 function 工程表清理_快速模式结束(state) {
     try { Application.CutCopyMode = false; } catch (e0) {}
     try { Application.StatusBar = false; } catch (e1) {}
-    if (!state) return;
-    try { if (state.calculation !== null) Application.Calculation = state.calculation; } catch (e2) {}
-    try { if (state.enableEvents !== null) Application.EnableEvents = state.enableEvents; } catch (e3) {}
-    try { if (state.screenUpdating !== null) Application.ScreenUpdating = state.screenUpdating; } catch (e4) {}
+    if (state) {
+        try { if (state.calculation !== null) Application.Calculation = state.calculation; } catch (e2) {}
+        try { if (state.enableEvents !== null) Application.EnableEvents = state.enableEvents; } catch (e3) {}
+        try { if (state.screenUpdating !== null) Application.ScreenUpdating = state.screenUpdating; } catch (e4) {}
+    }
+    工程表清理_恢复WPS窗口焦点();
+}
+
+function 工程表清理_恢复WPS窗口焦点() {
+    /*
+     * 只恢复 WPS 窗口本身，不强制切换工作表。
+     * 这样报告表等有意激活的结果页仍保持当前页，同时尽量避免
+     * 宏结束后随机把后台软件抬到前台。
+     */
+    try { Application.Visible = true; } catch (e0) {}
+    try {
+        var activeWindow = Application.ActiveWindow;
+        if (activeWindow && activeWindow.Activate) activeWindow.Activate();
+    } catch (e1) {}
 }
 
 function 工程表清理_内部执行(action, scopeMode) {
@@ -54,8 +116,17 @@ function 工程表清理_内部执行(action, scopeMode) {
     var MAX_TEXT_SEARCH_CELLS = 500000;
     var MAX_BORDER_SCAN_CELLS = 300000;
     var MAX_PDF_SCAN_CELLS = 350000;
-    var MAX_PDF_ISSUES = 120;
-    var BORDER_CORRECTIVE_PASSES = 3;
+    var MAX_PDF_ISSUES = 1200;
+    var MAX_AUDIT_ISSUES = 3000;
+    var REPORT_SHEET_PREFIX = "工程表清理_报告_";
+    var AUDIT_REPORT_SHEET_NAME = REPORT_SHEET_PREFIX + "工程表体检";
+    var PDF_REPORT_SHEET_NAME = REPORT_SHEET_PREFIX + "PDF风险检测";
+    var REPORT_MARKER = "__ECT_REPORT_V190__";
+    var PAGE_DIAGNOSTIC_REPORT_SHEET_NAME = REPORT_SHEET_PREFIX + "分页诊断";
+    var BORDER_DIAGNOSTIC_REPORT_SHEET_NAME = REPORT_SHEET_PREFIX + "线宽诊断";
+    var NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME = REPORT_SHEET_PREFIX + "序号诊断";
+    var BORDER_CORRECTIVE_PASSES = 2;
+    var BORDER_REPAIR_PASSES = 3;
     var JS_YES_NO = 4;
     var JS_QUESTION = 32;
     var JS_EXCLAMATION = 48;
@@ -421,7 +492,6 @@ function 工程表清理_内部执行(action, scopeMode) {
 
     function activateWorksheet(workbook, sheetName) {
         if (!workbook) throw new Error("没有目标工作簿。");
-        try { workbook.Activate(); } catch (workbookActivateError) {}
         var sheet = findWorksheet(workbook, sheetName);
         if (!sheet) throw new Error("找不到工作表：“" + sheetName + "”。");
         try {
@@ -431,8 +501,36 @@ function 工程表清理_内部执行(action, scopeMode) {
         } catch (visibilityError) {
             if (visibilityError && visibilityError.message) throw visibilityError;
         }
-        sheet.Activate();
-        try { workbook.Activate(); sheet.Activate(); } catch (repeatActivateError) {}
+
+        /*
+         * v1.8.4：只在确实需要时激活工作簿/工作表。
+         * 旧版每次都会 workbook.Activate → sheet.Activate → 再重复一次，
+         * WPS 在长循环中可能发生窗口焦点抖动，甚至让其它应用抢前台。
+         */
+        try {
+            var activeBookBefore = Application.ActiveWorkbook;
+            if (
+                !activeBookBefore ||
+                String(activeBookBefore.Name) !== String(workbook.Name)
+            ) {
+                workbook.Activate();
+            }
+        } catch (workbookActivateError) {
+            try { workbook.Activate(); } catch (ignored0) {}
+        }
+
+        try {
+            var activeSheetBefore = Application.ActiveSheet;
+            if (
+                !activeSheetBefore ||
+                String(activeSheetBefore.Name) !== String(sheetName)
+            ) {
+                sheet.Activate();
+            }
+        } catch (sheetActivateError) {
+            sheet.Activate();
+        }
+
         var activeBook = Application.ActiveWorkbook;
         var activeSheet = Application.ActiveSheet;
         if (!activeBook || String(activeBook.Name) !== String(workbook.Name)) {
@@ -949,7 +1047,7 @@ function 工程表清理_内部执行(action, scopeMode) {
 
 
     /*
-     * v1.8.0 稳定重写引擎：不依赖 WPS 的 Delete 接口。
+     * v1.8.1 稳定重写引擎：不依赖 WPS 的 Delete 接口。
      * 先保存合并结构，全部拆分，再把保留行逐行写到目标位置，最后重建合并区域。
      * 预览表能写入说明 Value2/Formula 写入可靠；本引擎只使用同一套可核验写入方式。
      */
@@ -1316,6 +1414,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             text === DUPLICATE_SHEET_NAME ||
             text === UNDO_META_SHEET_NAME ||
             text.indexOf(UNDO_BACKUP_PREFIX) === 0 ||
+            text.indexOf(REPORT_SHEET_PREFIX) === 0 ||
             text.indexOf("__重写自检") === 0;
     }
 
@@ -1412,7 +1511,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var workbook = context.workbook;
         var meta = findWorksheet(workbook, UNDO_META_SHEET_NAME);
         if (!meta) {
-            MsgBox("当前工作簿没有可撤回的插件操作。", JS_INFORMATION, "没有撤回点");
+            工程表清理_安全MsgBox("当前工作簿没有可撤回的插件操作。", JS_INFORMATION, "没有撤回点");
             return;
         }
         var bounds = getUsedBounds(meta);
@@ -1431,11 +1530,11 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         if (!records.length) {
             clearUndoPointInternal(workbook);
-            MsgBox("撤回点没有有效数据。", JS_EXCLAMATION, "无法撤回");
+            工程表清理_安全MsgBox("撤回点没有有效数据。", JS_EXCLAMATION, "无法撤回");
             return;
         }
         var label = records[0].actionLabel || "上一步插件操作";
-        if (MsgBox("将撤回：“" + label + "”。\n涉及" + records.length + "张工作表。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "撤回上一步") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("将撤回：“" + label + "”。\n涉及" + records.length + "张工作表。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "撤回上一步") !== JS_RESULT_YES) return;
 
         var oldAlerts = Application.DisplayAlerts;
         var restored = 0;
@@ -1473,9 +1572,9 @@ function 工程表清理_内部执行(action, scopeMode) {
         var message = "已撤回并恢复" + restored + "张工作表。";
         if (failures.length) {
             message += "\n\n未恢复：\n" + failures.slice(0, 12).join("\n");
-            MsgBox(message, JS_EXCLAMATION, "部分撤回");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分撤回");
         } else {
-            MsgBox(message, JS_INFORMATION, "撤回完成");
+            工程表清理_安全MsgBox(message, JS_INFORMATION, "撤回完成");
         }
     }
 
@@ -1483,12 +1582,12 @@ function 工程表清理_内部执行(action, scopeMode) {
         var context = getTargetContext(true);
         var workbook = context.workbook;
         if (!findWorksheet(workbook, UNDO_META_SHEET_NAME)) {
-            MsgBox("当前工作簿没有撤回点。", JS_INFORMATION, "无需清理");
+            工程表清理_安全MsgBox("当前工作簿没有撤回点。", JS_INFORMATION, "无需清理");
             return;
         }
-        if (MsgBox("将永久清除插件的一步撤回备份。\n是否继续？", JS_YES_NO + JS_QUESTION, "清除撤回点") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("将永久清除插件的一步撤回备份。\n是否继续？", JS_YES_NO + JS_QUESTION, "清除撤回点") !== JS_RESULT_YES) return;
         clearUndoPointInternal(workbook);
-        MsgBox("撤回点已清除。", JS_INFORMATION, "清理完成");
+        工程表清理_安全MsgBox("撤回点已清除。", JS_INFORMATION, "清理完成");
     }
 
     function rowTextItems(sheet, rowNumber, bounds) {
@@ -2180,14 +2279,181 @@ function 工程表清理_内部执行(action, scopeMode) {
     function parseSinglePrintArea(value) {
         var text = normalizeText(value);
         if (!text) return null;
-        var match = text.match(/\$?([A-Z]+)\$?(\d+)\s*:\s*\$?([A-Z]+)\$?(\d+)/i);
-        if (!match) return null;
-        return {
-            firstColumn: lettersToColumn(match[1]),
-            firstRow: Number(match[2]),
-            lastColumn: lettersToColumn(match[3]),
-            lastRow: Number(match[4])
+
+        /*
+         * v1.8.3：WPS 不同版本可能返回：
+         * $A$1:$H$82
+         * ='工作表'!$A$1:$H$82
+         * $A$1:$H$20,$A$25:$H$82
+         * 或 R1C1:R82C8。
+         * 这里统一取所有区域的外包矩形，避免把“已设置打印区域”误判为空。
+         */
+        var result = null;
+        var a1 = /\$?([A-Z]+)\$?(\d+)\s*:\s*\$?([A-Z]+)\$?(\d+)/ig;
+        var match = null;
+        while ((match = a1.exec(text)) !== null) {
+            var firstColumn = lettersToColumn(match[1]);
+            var firstRow = Number(match[2]);
+            var lastColumn = lettersToColumn(match[3]);
+            var lastRow = Number(match[4]);
+            if (!result) {
+                result = {
+                    firstColumn: Math.min(firstColumn, lastColumn),
+                    firstRow: Math.min(firstRow, lastRow),
+                    lastColumn: Math.max(firstColumn, lastColumn),
+                    lastRow: Math.max(firstRow, lastRow)
+                };
+            } else {
+                result.firstColumn = Math.min(result.firstColumn, firstColumn, lastColumn);
+                result.firstRow = Math.min(result.firstRow, firstRow, lastRow);
+                result.lastColumn = Math.max(result.lastColumn, firstColumn, lastColumn);
+                result.lastRow = Math.max(result.lastRow, firstRow, lastRow);
+            }
+        }
+        if (result) return result;
+
+        var r1c1 = /R(\d+)C(\d+)\s*:\s*R(\d+)C(\d+)/ig;
+        while ((match = r1c1.exec(text)) !== null) {
+            var r1 = Number(match[1]);
+            var c1 = Number(match[2]);
+            var r2 = Number(match[3]);
+            var c2 = Number(match[4]);
+            if (!result) {
+                result = {
+                    firstColumn: Math.min(c1, c2),
+                    firstRow: Math.min(r1, r2),
+                    lastColumn: Math.max(c1, c2),
+                    lastRow: Math.max(r1, r2)
+                };
+            } else {
+                result.firstColumn = Math.min(result.firstColumn, c1, c2);
+                result.firstRow = Math.min(result.firstRow, r1, r2);
+                result.lastColumn = Math.max(result.lastColumn, c1, c2);
+                result.lastRow = Math.max(result.lastRow, r1, r2);
+            }
+        }
+        return result;
+    }
+
+    function printAreaBoundsFromRangeObject(rangeObject) {
+        if (!rangeObject) return null;
+        try {
+            var firstRow = Number(rangeObject.Row);
+            var firstColumn = Number(rangeObject.Column);
+            var rowCount = Number(rangeObject.Rows.Count);
+            var columnCount = Number(rangeObject.Columns.Count);
+            if (
+                isFinite(firstRow) && firstRow >= 1 &&
+                isFinite(firstColumn) && firstColumn >= 1 &&
+                isFinite(rowCount) && rowCount >= 1 &&
+                isFinite(columnCount) && columnCount >= 1
+            ) {
+                return {
+                    firstRow: firstRow,
+                    firstColumn: firstColumn,
+                    lastRow: firstRow + rowCount - 1,
+                    lastColumn: firstColumn + columnCount - 1
+                };
+            }
+        } catch (ignored) {}
+        return null;
+    }
+
+    function getPrintAreaState(sheet) {
+        var state = {
+            bounds: null,
+            text: "",
+            source: "",
+            directReadable: false
         };
+
+        try {
+            var direct = normalizeText(sheet.PageSetup.PrintArea);
+            state.directReadable = true;
+            if (direct) {
+                var directBounds = parseSinglePrintArea(direct);
+                if (directBounds) {
+                    state.bounds = directBounds;
+                    state.text = direct;
+                    state.source = "PageSetup.PrintArea";
+                    return state;
+                }
+            }
+        } catch (ignored0) {}
+
+        function tryNames(names, sourceLabel) {
+            if (!names) return false;
+            var count = 0;
+            try { count = Number(names.Count); } catch (ignored1) { return false; }
+            for (var i = 1; i <= count; i += 1) {
+                try {
+                    var item = names.Item(i);
+                    var itemName = "";
+                    try { itemName = normalizeText(item.Name).toLowerCase(); } catch (ignored2) {}
+                    if (itemName.indexOf("print_area") < 0 && itemName.indexOf("printarea") < 0) continue;
+
+                    var rangeBounds = null;
+                    try { rangeBounds = printAreaBoundsFromRangeObject(item.RefersToRange); } catch (ignored3) {}
+                    if (rangeBounds) {
+                        state.bounds = rangeBounds;
+                        state.source = sourceLabel + ".RefersToRange";
+                        try { state.text = normalizeText(item.RefersTo); } catch (ignored4) {}
+                        return true;
+                    }
+
+                    var refers = "";
+                    try { refers = normalizeText(item.RefersTo); } catch (ignored5) {}
+                    if (!refers) {
+                        try { refers = normalizeText(item.RefersToLocal); } catch (ignored6) {}
+                    }
+                    var parsed = parseSinglePrintArea(refers);
+                    if (parsed) {
+                        state.bounds = parsed;
+                        state.text = refers;
+                        state.source = sourceLabel + ".RefersTo";
+                        return true;
+                    }
+                } catch (ignored7) {}
+            }
+            return false;
+        }
+
+        try {
+            if (tryNames(sheet.Names, "Sheet.Names")) return state;
+        } catch (ignored8) {}
+
+        try {
+            var workbook = sheet.Parent;
+            var workbookNames = workbook ? workbook.Names : null;
+            if (workbookNames) {
+                var sheetNameLower = normalizeText(sheet.Name).toLowerCase();
+                var count = Number(workbookNames.Count);
+                for (var n = 1; n <= count; n += 1) {
+                    try {
+                        var nameItem = workbookNames.Item(n);
+                        var fullName = normalizeText(nameItem.Name).toLowerCase();
+                        if (fullName.indexOf("print_area") < 0 && fullName.indexOf("printarea") < 0) continue;
+                        /* 工作簿级名称可能包含多张表，优先要求名称或引用里出现当前表名。 */
+                        var refersText = "";
+                        try { refersText = normalizeText(nameItem.RefersTo); } catch (ignored9) {}
+                        var joined = (fullName + " " + refersText).toLowerCase();
+                        if (joined.indexOf(sheetNameLower) < 0 && count > 1) continue;
+
+                        var namedBounds = null;
+                        try { namedBounds = printAreaBoundsFromRangeObject(nameItem.RefersToRange); } catch (ignored10) {}
+                        if (!namedBounds) namedBounds = parseSinglePrintArea(refersText);
+                        if (namedBounds) {
+                            state.bounds = namedBounds;
+                            state.text = refersText;
+                            state.source = "Workbook.Names";
+                            return state;
+                        }
+                    } catch (ignored11) {}
+                }
+            }
+        } catch (ignored12) {}
+
+        return state;
     }
 
     function getLogicalPrintBottomRow(
@@ -2202,6 +2468,38 @@ function 工程表清理_内部执行(action, scopeMode) {
     }
 
 
+    function hasHorizontalBreakBeforeRow(
+        sheet,
+        rowNumber
+    ) {
+        var row = Number(rowNumber);
+        if (!isFinite(row) || row < 2) return false;
+
+        /*
+         * Range.PageBreak 是 WPS/ET 官方可读写属性。
+         * whole-workbook 模式下 HPageBreaks.Add 偶尔“调用成功但没有真正落盘”，
+         * 因此优先回读行本身的 PageBreak 状态，再以 HPageBreaks 集合作兜底。
+         */
+        try {
+            var rowBreak = Number(sheet.Rows.Item(row).PageBreak);
+            if (rowBreak === -4135 || rowBreak === -4105) return true;
+        } catch (ignored0) {}
+
+        try {
+            var cellBreak = Number(sheet.Cells.Item(row, 1).PageBreak);
+            if (cellBreak === -4135 || cellBreak === -4105) return true;
+        } catch (ignored1) {}
+
+        try {
+            var breaks = sheet.HPageBreaks;
+            for (var i = 1; i <= Number(breaks.Count); i += 1) {
+                var locationRow = Number(breaks.Item(i).Location.Row);
+                if (locationRow === row) return true;
+            }
+        } catch (ignored2) {}
+        return false;
+    }
+
     function addHorizontalBreakBeforeRow(
         sheet,
         rowNumber,
@@ -2212,6 +2510,11 @@ function 工程表清理_内部执行(action, scopeMode) {
         if (!isFinite(row) || row < 2) return false;
         if (!isFinite(column) || column < 1) column = 1;
 
+        /*
+         * v1.8.8：恢复 v1.8.5 已在用户机器上验证稳定的写入顺序。
+         * v1.8.6 把 Range.PageBreak 作为主写入路径后，反而让“当前工作表”
+         * 也出现分页异常，所以不再主动写 Rows/Cells.PageBreak。
+         */
         try {
             sheet.HPageBreaks.Add(
                 sheet.Cells.Item(row, column)
@@ -2233,6 +2536,44 @@ function 工程表清理_内部执行(action, scopeMode) {
             return true;
         } catch (ignored2) {}
         return false;
+    }
+
+    function getMissingDesiredPageBreakRows(
+        sheet,
+        desiredRows
+    ) {
+        var missing = [];
+        for (var i = 0; i < desiredRows.length; i += 1) {
+            var row = Number(desiredRows[i]);
+            if (!hasHorizontalBreakBeforeRow(sheet, row)) missing.push(row);
+        }
+        return missing;
+    }
+
+    function verifyAndRepairDesiredPageBreaks(
+        sheet,
+        desiredRows,
+        firstColumn
+    ) {
+        var missing = getMissingDesiredPageBreakRows(sheet, desiredRows);
+        if (!missing.length) {
+            return { missing: [], confirmed: desiredRows.slice(0) };
+        }
+
+        for (var i = 0; i < missing.length; i += 1) {
+            addHorizontalBreakBeforeRow(sheet, missing[i], firstColumn);
+        }
+        refreshPageBreakDisplay(sheet);
+        try { sheet.Calculate(); } catch (ignored0) {}
+
+        missing = getMissingDesiredPageBreakRows(sheet, desiredRows);
+        var missingMap = {};
+        for (var m = 0; m < missing.length; m += 1) missingMap[missing[m]] = true;
+        var confirmed = [];
+        for (var d = 0; d < desiredRows.length; d += 1) {
+            if (!missingMap[desiredRows[d]]) confirmed.push(desiredRows[d]);
+        }
+        return { missing: missing, confirmed: confirmed };
     }
 
     function removeManualBreaksInsideHeaderBlock(
@@ -2533,6 +2874,38 @@ function 工程表清理_内部执行(action, scopeMode) {
         return false;
     }
 
+    function collapseWideTitleRowsToSectionStarts(
+        titleRows
+    ) {
+        var starts = [];
+        var previous = null;
+
+        for (
+            var i = 0;
+            i < titleRows.length;
+            i += 1
+        ) {
+            var row = Number(titleRows[i]);
+            if (!isFinite(row)) continue;
+
+            /*
+             * v1.9.1：同一张表顶部经常连续出现“表名 + 工程名称/项目名称”。
+             * 旧版把每一行宽合并文字都当成独立表名，于是 A1 标题后面的 A2
+             * “工程名称：……”也会被写成手动分页，直接制造 1 行第一页。
+             * 相邻（或中间只隔 1 行）的宽标题候选应归为同一个表头组，
+             * 只保留该组第一行作为这张表的起点。
+             */
+            if (
+                previous === null ||
+                row > previous + 2
+            ) {
+                starts.push(row);
+            }
+            previous = row;
+        }
+        return starts;
+    }
+
     function detectDesiredPageBreakRows(
         sheet,
         bounds
@@ -2542,8 +2915,8 @@ function 工程表清理_内部执行(action, scopeMode) {
         var titleRows = [];
 
         /*
-         * 分页优先按后续宽合并表名定位。表名行即新页起点，
-         * 不再把表内小计粗线、分类粗线误判为分页线。
+         * 分页优先按“独立表头组”的起始行定位。
+         * v1.9.1 不再把同一表内连续的宽合并说明行分别当成新表起点。
          */
         for (
             var row = bounds.firstRow;
@@ -2561,18 +2934,28 @@ function 工程表清理_内部执行(action, scopeMode) {
             }
         }
 
-        if (titleRows.length >= 2) {
+        var titleStarts =
+            collapseWideTitleRowsToSectionStarts(
+                titleRows
+            );
+
+        if (titleStarts.length >= 2) {
             for (
                 var t = 1;
-                t < titleRows.length;
+                t < titleStarts.length;
                 t += 1
             ) {
-                if (!seen[titleRows[t]]) {
-                    seen[titleRows[t]] = true;
-                    result.push(titleRows[t]);
+                if (!seen[titleStarts[t]]) {
+                    seen[titleStarts[t]] = true;
+                    result.push(titleStarts[t]);
                 }
             }
-        } else {
+        } else if (!titleStarts.length) {
+            /*
+             * 完全没有可识别的宽表名时，才退回连续边框块。
+             * 只识别到一张表的表头组时保持保守，不因为表内空行/分段边框
+             * 额外制造手动分页线，自动分页交给 WPS 自己计算。
+             */
             var blocks =
                 detectBorderTableBlocks(
                     sheet,
@@ -2608,6 +2991,320 @@ function 工程表清理_内部执行(action, scopeMode) {
         return result;
     }
 
+
+
+    function getRowPageBreakType(sheet, rowNumber, firstColumn) {
+        var row = Number(rowNumber);
+        var column = Number(firstColumn || 1);
+        if (!isFinite(row) || row < 1) return -4142;
+        if (!isFinite(column) || column < 1) column = 1;
+
+        /*
+         * WPS/ET 的 Range.PageBreak 可直接返回：
+         * -4105 = 自动分页
+         * -4135 = 手动分页
+         * -4142 = 无分页
+         *
+         * 整本模式不再只依赖 HPageBreaks 集合，因为 PrintArea 改写后
+         * 该集合本身会重新计算，批量切表时容易读到尚未刷新的集合状态。
+         */
+        try {
+            var rowType = Number(sheet.Rows.Item(row).PageBreak);
+            if (rowType === -4105 || rowType === -4135 || rowType === -4142) {
+                return rowType;
+            }
+        } catch (ignored0) {}
+
+        try {
+            var cellType = Number(sheet.Cells.Item(row, column).PageBreak);
+            if (cellType === -4105 || cellType === -4135 || cellType === -4142) {
+                return cellType;
+            }
+        } catch (ignored1) {}
+
+        return -4142;
+    }
+
+    function getActualHorizontalPageBreakRows(sheet, bounds) {
+        var rows = [];
+        var seen = {};
+        if (!bounds) return rows;
+
+        /*
+         * v1.8.9：直接逐行读取 PageBreak。
+         * 这才对应分页预览里用户实际看到的蓝色水平线，
+         * 包括 WPS 自动分页线，而不只是插件手工 Add 出来的分页符。
+         */
+        for (var row = Math.max(2, bounds.firstRow + 1); row <= bounds.lastRow; row += 1) {
+            var breakType = getRowPageBreakType(sheet, row, bounds.firstColumn);
+            if (breakType === -4105 || breakType === -4135) {
+                seen[row] = true;
+                rows.push(row);
+            }
+        }
+
+        /* HPageBreaks 仅作为兼容兜底，补充极少数 PageBreak 回读为空的版本。 */
+        try {
+            var breaks = sheet.HPageBreaks;
+            var count = Number(breaks.Count);
+            for (var i = 1; i <= count; i += 1) {
+                try {
+                    var hRow = Number(breaks.Item(i).Location.Row);
+                    if (!isFinite(hRow) || hRow < 2) continue;
+                    if (hRow <= bounds.firstRow || hRow > bounds.lastRow) continue;
+                    if (!seen[hRow]) {
+                        seen[hRow] = true;
+                        rows.push(hRow);
+                    }
+                } catch (ignored2) {}
+            }
+        } catch (ignored3) {}
+
+        rows.sort(function (a, b) { return a - b; });
+        return rows;
+    }
+
+    function clearHorizontalBreakBeforeRow(sheet, rowNumber, firstColumn) {
+        var row = Number(rowNumber);
+        var column = Number(firstColumn || 1);
+        if (!isFinite(row) || row < 2) return false;
+        if (!isFinite(column) || column < 1) column = 1;
+
+        var changed = false;
+
+        /* Range.PageBreak 官方为可读写属性，优先直接把该行恢复为无分页。 */
+        try {
+            sheet.Rows.Item(row).PageBreak = -4142;
+            changed = true;
+        } catch (ignored0) {}
+        try {
+            sheet.Cells.Item(row, column).PageBreak = -4142;
+            changed = true;
+        } catch (ignored1) {}
+
+        /*
+         * 如果它是手工分页符，再尝试从 HPageBreaks 集合删除。
+         * 自动分页线不能总是直接 Delete，但在前面 PageBreak=None +
+         * 新增更早手动分页以后，WPS 会重新计算自动分页位置。
+         */
+        try {
+            var breaks = sheet.HPageBreaks;
+            for (var i = Number(breaks.Count); i >= 1; i -= 1) {
+                try {
+                    if (Number(breaks.Item(i).Location.Row) === row) {
+                        try {
+                            breaks.Item(i).Delete();
+                            changed = true;
+                        } catch (ignored2) {
+                            try {
+                                breaks.Item(i).DragOff(-4121, 1);
+                                changed = true;
+                            } catch (ignored3) {}
+                        }
+                    }
+                } catch (ignored4) {}
+            }
+        } catch (ignored5) {}
+
+        return changed;
+    }
+
+    function rowHasMeaningfulPrintContent(sheet, row, bounds) {
+        var firstColumn = bounds ? bounds.firstColumn : 1;
+        var lastColumn = bounds ? bounds.lastColumn : firstColumn;
+        for (var column = firstColumn; column <= lastColumn; column += 1) {
+            var cell = sheet.Cells.Item(row, column);
+            if (!isTopLeftOfMerge(cell)) continue;
+            if (cellHasFormula(cell) || !isBlankValue(readMergedAwareValue(cell))) return true;
+        }
+        return false;
+    }
+
+    function rowLooksLikeSummaryRow(sheet, row, bounds) {
+        var text = "";
+        for (var column = bounds.firstColumn; column <= bounds.lastColumn; column += 1) {
+            try {
+                var cell = sheet.Cells.Item(row, column);
+                if (!isTopLeftOfMerge(cell)) continue;
+                var value = normalizeText(readMergedAwareValue(cell));
+                if (value) text += " " + value;
+            } catch (ignored0) {}
+        }
+        return /(^|[\s：:])(合\s*计|总\s*计|小\s*计|汇\s*总)([\s：:]|$)/.test(text) ||
+            /^(合\s*计|总\s*计|小\s*计|汇\s*总)/.test(text.trim());
+    }
+
+    function detectShortFinalPage(sheet, bounds, desiredRows) {
+        if (!bounds || bounds.lastRow <= bounds.firstRow) return null;
+        var actualBreakRows = getActualHorizontalPageBreakRows(sheet, bounds);
+        if (!actualBreakRows.length) return null;
+
+        var breakRow = actualBreakRows[actualBreakRows.length - 1];
+        var meaningfulRows = [];
+        for (var row = breakRow; row <= bounds.lastRow; row += 1) {
+            if (rowHasMeaningfulPrintContent(sheet, row, bounds)) meaningfulRows.push(row);
+        }
+        if (!meaningfulRows.length) return null;
+
+        var hasSummary = false;
+        for (var s = 0; s < meaningfulRows.length; s += 1) {
+            if (rowLooksLikeSummaryRow(sheet, meaningfulRows[s], bounds)) {
+                hasSummary = true;
+                break;
+            }
+        }
+
+        /*
+         * v1.8.9：
+         * - 尾页仅 1~4 个有效行：直接视为明显短尾页；
+         * - 5~6 行但包含“合计/总计/汇总”：也纳入平衡；
+         * - 其余短页保持 WPS 自动分页，不主动干预。
+         */
+        if (meaningfulRows.length > 6) return null;
+        if (meaningfulRows.length > 4 && !hasSummary) return null;
+
+        /* 若最后分页本身就是一个明确的后续表格起点，不把它当“孤尾页”。 */
+        if (desiredRows && desiredRows.length) {
+            for (var i = 0; i < desiredRows.length; i += 1) {
+                if (Number(desiredRows[i]) === breakRow) return null;
+            }
+        }
+
+        var summaryOnly = true;
+        for (var m = 0; m < meaningfulRows.length; m += 1) {
+            if (!rowLooksLikeSummaryRow(sheet, meaningfulRows[m], bounds)) {
+                summaryOnly = false;
+                break;
+            }
+        }
+
+        return {
+            breakRow: breakRow,
+            meaningfulRows: meaningfulRows,
+            meaningfulCount: meaningfulRows.length,
+            summaryOnly: summaryOnly,
+            actualBreakRows: actualBreakRows
+        };
+    }
+
+    function findSafeTailBalanceBreakRow(sheet, bounds, shortTail, desiredRows) {
+        if (!shortTail) return null;
+        var targetMeaningful = 6;
+        var count = 0;
+        var candidate = null;
+        for (var row = shortTail.breakRow - 1; row > bounds.firstRow; row -= 1) {
+            if (rowHasMeaningfulPrintContent(sheet, row, bounds)) {
+                count += 1;
+                candidate = row;
+                if (count >= targetMeaningful) break;
+            }
+        }
+        if (!candidate || candidate <= bounds.firstRow) return null;
+
+        /* 避免与插件认定的“新表起点”冲突。 */
+        if (desiredRows && desiredRows.length) {
+            for (var i = 0; i < desiredRows.length; i += 1) {
+                var d = Number(desiredRows[i]);
+                if (d > candidate && d < shortTail.breakRow) candidate = d;
+            }
+        }
+
+        /* 不能从纵向合并区域中间切开。 */
+        for (var col = bounds.firstColumn; col <= bounds.lastColumn; col += 1) {
+            try {
+                var cell = sheet.Cells.Item(candidate, col);
+                if (cell.MergeCells) {
+                    var area = cell.MergeArea;
+                    var top = Number(area.Row);
+                    var bottom = top + Number(area.Rows.Count) - 1;
+                    if (top < candidate && bottom >= candidate) candidate = top;
+                }
+            } catch (ignored0) {}
+        }
+        return candidate > bounds.firstRow ? candidate : null;
+    }
+
+    function repairShortFinalPage(sheet, bounds, desiredRows, firstColumn) {
+        var before = detectShortFinalPage(sheet, bounds, desiredRows);
+        if (!before) return { changed: false, fixed: true, before: null, after: null };
+
+        var originalBreakRow = before.breakRow;
+        var column = Number(firstColumn || bounds.firstColumn);
+        var candidate = findSafeTailBalanceBreakRow(sheet, bounds, before, desiredRows);
+        if (!candidate) return { changed: false, fixed: false, before: before, after: before };
+
+        /*
+         * v1.8.9：以前只是“在更早位置再加一条手动分页”，但旧的自动蓝线
+         * 可能仍留在合计前，所以肉眼看起来完全没修。
+         *
+         * 现在顺序改成：
+         * 1. 直接把旧行 PageBreak 设为 None；
+         * 2. 在更早的安全行建立手动分页；
+         * 3. 重新计算并逐行回读实际蓝线；
+         * 4. 若尾页仍过短，再向前多抓 2 行，最多 3 轮。
+         */
+        var changed = false;
+        var insertedRow = null;
+        var after = before;
+        var attemptCandidate = candidate;
+
+        for (var attempt = 0; attempt < 3; attempt += 1) {
+            clearHorizontalBreakBeforeRow(sheet, originalBreakRow, column);
+
+            if (attemptCandidate && attemptCandidate > bounds.firstRow) {
+                if (addHorizontalBreakBeforeRow(sheet, attemptCandidate, column)) {
+                    changed = true;
+                    insertedRow = attemptCandidate;
+                }
+            }
+
+            try { sheet.Calculate(); } catch (ignored0) {}
+            try { Application.Calculate(); } catch (ignored1) {}
+            refreshPageBreakDisplay(sheet);
+
+            after = detectShortFinalPage(sheet, bounds, desiredRows);
+            if (!after) {
+                return {
+                    changed: changed,
+                    fixed: true,
+                    before: before,
+                    after: null,
+                    insertedRow: insertedRow
+                };
+            }
+
+            /*
+             * 仍然出现短尾页时，再把分页起点往前推 2 个有效行。
+             * 不根据固定行号硬减，避免跨过高行/合并行。
+             */
+            var needMore = 2;
+            var found = 0;
+            var nextCandidate = attemptCandidate - 1;
+            for (var r = attemptCandidate - 1; r > bounds.firstRow; r -= 1) {
+                if (rowHasMeaningfulPrintContent(sheet, r, bounds)) {
+                    found += 1;
+                    nextCandidate = r;
+                    if (found >= needMore) break;
+                }
+            }
+            if (!nextCandidate || nextCandidate <= bounds.firstRow || nextCandidate >= attemptCandidate) {
+                break;
+            }
+
+            /* 清掉上一轮插件插入的手工分页，再使用更早的新位置。 */
+            clearHorizontalBreakBeforeRow(sheet, attemptCandidate, column);
+            attemptCandidate = nextCandidate;
+            originalBreakRow = after.breakRow;
+        }
+
+        return {
+            changed: changed,
+            fixed: !after,
+            before: before,
+            after: after,
+            insertedRow: insertedRow
+        };
+    }
 
     function clearAllPageBreaks(
         sheet
@@ -2671,9 +3368,76 @@ function 工程表清理_内部执行(action, scopeMode) {
         } catch (ignored1) {}
     }
 
+    function forceRefreshWorksheetForPrint(sheet) {
+        /*
+         * WPS 在 ScreenUpdating=false 时快速切换大量工作表，
+         * PageSetup / UsedRange / 分页符集合有时仍停留在上一张表的缓存状态。
+         * 当前表单独执行正常而“整个工作簿”误识别，主要就是这个差异。
+         */
+        try { Application.ScreenUpdating = true; } catch (ignored0) {}
+        try { sheet.Activate(); } catch (ignored1) {}
+        try { var used = sheet.UsedRange; var usedAddress = used.Address; } catch (ignored2) {}
+        try { sheet.Calculate(); } catch (ignored3) {}
+        try { var pageText = sheet.PageSetup.PrintArea; } catch (ignored4) {}
+        try { sheet.DisplayPageBreaks = true; } catch (ignored5) {}
+        try { var hCount = sheet.HPageBreaks.Count; } catch (ignored6) {}
+        try { var vCount = sheet.VPageBreaks.Count; } catch (ignored7) {}
+        return true;
+    }
+
+    function samePrintBounds(left, right) {
+        if (!left || !right) return false;
+        return (
+            Number(left.firstRow) === Number(right.firstRow) &&
+            Number(left.lastRow) === Number(right.lastRow) &&
+            Number(left.firstColumn) === Number(right.firstColumn) &&
+            Number(left.lastColumn) === Number(right.lastColumn)
+        );
+    }
+
+
+    function applyPrintAreaRobustly(sheet, address, expectedBounds, aggressive) {
+        var state = null;
+        function readBack() {
+            state = getPrintAreaState(sheet);
+            return samePrintBounds(state.bounds, expectedBounds);
+        }
+
+        try { sheet.PageSetup.PrintArea = address; } catch (ignored0) {}
+        if (readBack()) return state;
+
+        if (aggressive) {
+            /*
+             * 整本批量时，WPS 偶尔会保留上一张表的 PageSetup 缓存。
+             * 先清空再写、重新激活后用 ActiveSheet 写，再用“选区地址”方式写一次。
+             * 官方示例也建议激活工作表后给 ActiveSheet.PageSetup.PrintArea 赋 Address。
+             */
+            try { sheet.Activate(); } catch (ignored1) {}
+            try { Application.ActiveSheet.PageSetup.PrintArea = ""; } catch (ignored2) {}
+            try { Application.ActiveSheet.PageSetup.PrintArea = address; } catch (ignored3) {}
+            if (readBack()) return state;
+
+            try {
+                var area = Application.ActiveSheet.Range(address);
+                area.Select();
+                var selectedAddress = Application.Selection.Address();
+                Application.ActiveSheet.PageSetup.PrintArea = selectedAddress;
+            } catch (ignored4) {}
+            try { Application.ActiveSheet.Calculate(); } catch (ignored5) {}
+            try { Application.Calculate(); } catch (ignored6) {}
+            refreshPageBreakDisplay(Application.ActiveSheet);
+            readBack();
+        }
+        return state || getPrintAreaState(sheet);
+    }
+
     function rebuildPrintLayoutOnSheet(
-        sheet
+        sheet,
+        options
     ) {
+        options = options || {};
+        var strictBottom = !!options.strictBottom;
+        var robustPrintArea = !!options.robustPrintArea;
         var actual =
             getActualContentBounds(
                 sheet
@@ -2706,8 +3470,9 @@ function 工程表清理_内部执行(action, scopeMode) {
                     bounds.firstRow,
                     blocks[0].firstRow
                 );
-            bounds.lastRow =
-                Math.max(
+            bounds.lastRow = strictBottom
+                ? actual.lastRow
+                : Math.max(
                     actual.lastRow,
                     blocks[
                         blocks.length - 1
@@ -2732,6 +3497,13 @@ function 工程表清理_内部执行(action, scopeMode) {
             }
         }
 
+        /* v1.8.8：整本模式底边只认实际非空/公式内容的最后一行，
+         * 不让 UsedRange 残留边框或空模板把蓝色打印底边继续向下拖。 */
+        if (strictBottom) {
+            bounds.lastRow = actual.lastRow;
+            if (bounds.firstRow > bounds.lastRow) bounds.firstRow = actual.firstRow;
+        }
+
         var address =
             "$" +
             columnToLetters(
@@ -2744,8 +3516,18 @@ function 工程表清理_内部执行(action, scopeMode) {
             ) +
             "$" + bounds.lastRow;
 
-        sheet.PageSetup.PrintArea =
-            address;
+        var expectedPrintBounds = {
+            firstRow: bounds.firstRow,
+            lastRow: bounds.lastRow,
+            firstColumn: bounds.firstColumn,
+            lastColumn: bounds.lastColumn
+        };
+        var readback = applyPrintAreaRobustly(
+            sheet,
+            address,
+            expectedPrintBounds,
+            robustPrintArea
+        );
 
         /*
          * 不强制FitToPagesWide=1。强制按页数缩放会让WPS持续
@@ -2780,11 +3562,15 @@ function 工程表清理_内部执行(action, scopeMode) {
 
         return {
             address: address,
+            desiredBreakRows: breakRows,
             breakRows: added,
+            missingBreakRows: [],
             bottomRow: bounds.lastRow,
             firstColumn: bounds.firstColumn,
             lastColumn: bounds.lastColumn,
-            tableBlocks: blocks.length
+            tableBlocks: blocks.length,
+            printAreaVerified: samePrintBounds(readback.bounds, expectedPrintBounds),
+            printAreaReadSource: readback.source || ""
         };
     }
 
@@ -2815,13 +3601,9 @@ function 工程表清理_内部执行(action, scopeMode) {
                     bounds.firstRow,
                     blocks[0].firstRow
                 );
-            bounds.lastRow =
-                Math.max(
-                    actual.lastRow,
-                    blocks[
-                        blocks.length - 1
-                    ].lastRow
-                );
+            /* v1.8.8：底部打印边线只贴实际内容最后一行，
+             * 空白模板/残留边框不再延长 PrintArea。 */
+            bounds.lastRow = actual.lastRow;
             for (
                 var i = 0;
                 i < blocks.length;
@@ -2840,6 +3622,8 @@ function 工程表清理_内部执行(action, scopeMode) {
             }
         }
 
+        bounds.lastRow = actual.lastRow;
+
         var address =
             "$" +
             columnToLetters(
@@ -2856,8 +3640,13 @@ function 工程表清理_内部执行(action, scopeMode) {
          * 普通删行/删列后只收缩PrintArea，不清除分页符。
          * 用户手动拖动好的分页线会被保留。
          */
-        sheet.PageSetup.PrintArea =
-            address;
+        var expectedBounds = {
+            firstRow: bounds.firstRow,
+            lastRow: bounds.lastRow,
+            firstColumn: bounds.firstColumn,
+            lastColumn: bounds.lastColumn
+        };
+        applyPrintAreaRobustly(sheet, address, expectedBounds, true);
         refreshPageBreakDisplay(sheet);
         return address;
     }
@@ -2908,151 +3697,265 @@ function 工程表清理_内部执行(action, scopeMode) {
     }
 
 
+    function repairWorkbookPageBreaksOnFreshActiveSheet(
+        sheet,
+        desiredRows,
+        firstColumn
+    ) {
+        /*
+         * 只给“整个工作簿”模式使用。
+         * 重点不是换另一种分页 API，而是在 Activate 以后重新取得
+         * Application.ActiveSheet，用当前活动表的 HPageBreaks 集合写入。
+         * 这避开 WPS 在长循环里保留旧 Worksheet/PageSetup 句柄的问题。
+         */
+        var target = sheet;
+        try {
+            var active = Application.ActiveSheet;
+            if (active && String(active.Name) === String(sheet.Name)) {
+                target = active;
+            }
+        } catch (ignored0) {}
+
+        var repaired = 0;
+        var missing = [];
+        for (var i = 0; i < desiredRows.length; i += 1) {
+            var row = Number(desiredRows[i]);
+            if (hasHorizontalBreakBeforeRow(target, row)) continue;
+            try {
+                target.HPageBreaks.Add(
+                    target.Cells.Item(row, firstColumn)
+                );
+            } catch (ignored1) {}
+            if (hasHorizontalBreakBeforeRow(target, row)) repaired += 1;
+            else missing.push(row);
+        }
+        refreshPageBreakDisplay(target);
+        return { repaired: repaired, missing: missing };
+    }
+
     function alignTableBottomByScope(mode) {
-        var context =
-            getTargetContext(false);
-        var workbook =
-            context.workbook;
-        var originalSheetName =
-            getOriginalActiveSheetName(
-                workbook
-            );
-        var sheetNames =
-            getScopeSheetNames(
-                workbook,
-                context.sheet,
-                mode
-            );
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, mode);
 
         if (
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "将重新建立打印布局：" +
                 "\n1. PrintArea按实际内容和连续表格块重设；" +
                 "\n2. 清除旧的手动水平、垂直分页符；" +
                 "\n3. 在后续宽合并表名行之前重新放置水平分页线；" +
                 "\n4. 不强制一页宽，保留现有缩放方式。" +
+                (mode === "workbook"
+                    ? "\n5. 整本模式会逐张激活后重新取得 ActiveSheet，并临时使用自动计算刷新分页；若最后一页只剩合计/1~2行，会自动把最后一个分页起点前移。"
+                    : "") +
                 "\n\n处理范围：" +
-                (
-                    mode === "workbook"
-                        ? "整个工作簿（" +
-                          sheetNames.length +
-                          "张）"
-                        : "当前工作表"
-                ) +
+                (mode === "workbook"
+                    ? "整个工作簿（" + sheetNames.length + "张）"
+                    : "当前工作表") +
                 "\n\n是否继续？",
                 JS_YES_NO + JS_QUESTION,
                 "重建打印范围与分页线"
             ) !== JS_RESULT_YES
-        ) {
-            return;
-        }
+        ) return;
 
         var completed = 0;
         var breakCount = 0;
         var blockCount = 0;
         var failures = [];
         var examples = [];
+        var verifyFailures = [];
+        var pageBreakFailures = [];
+        var tailBalancedCount = 0;
+        var tailBalanceFailures = [];
 
-        for (
-            var i = 0;
-            i < sheetNames.length;
-            i += 1
-        ) {
+        /*
+         * 快速模式默认把 Calculation 设为手动，这对普通清理很有效，
+         * 但 WPS 的分页/打印布局在多工作表切换时会因此延迟刷新。
+         * 当前表不改变已验证路径；只有整本重建临时切回自动计算。
+         */
+        if (mode === "workbook") {
+            try { Application.Calculation = -4105; } catch (ignoredCalcMode) {}
+        }
+
+        for (var i = 0; i < sheetNames.length; i += 1) {
             updateProgress(
-                "重建打印范围与分页线",
+                mode === "workbook" ? "逐张重建打印布局" : "重建打印范围与分页线",
                 i + 1,
                 sheetNames.length
             );
-
             try {
-                var sheet =
-                    activateWorksheet(
-                        workbook,
-                        sheetNames[i]
-                    );
-                clearStaleTailOnSheet(
-                    sheet
-                );
-                var result =
-                    rebuildPrintLayoutOnSheet(
-                        sheet
-                    );
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
 
-                breakCount +=
-                    result.breakRows.length;
-                blockCount +=
-                    Number(
-                        result.tableBlocks || 0
+                /*
+                 * 整本模式必须在 Activate 之后重新取 ActiveSheet。
+                 * WPS 在循环中对旧 Worksheet 句柄的 PageSetup/HPageBreaks
+                 * 偶发读写仍指向上一轮分页缓存；单表模式不存在这个差异。
+                 */
+                if (mode === "workbook") {
+                    try {
+                        var freshSheet = Application.ActiveSheet;
+                        if (freshSheet && String(freshSheet.Name) === String(sheetNames[i])) {
+                            sheet = freshSheet;
+                        }
+                    } catch (ignoredFreshSheet) {}
+                    try { sheet.Calculate(); } catch (ignoredCalc) {}
+                    try { sheet.DisplayPageBreaks = true; } catch (ignoredDisplay) {}
+                }
+
+                clearStaleTailOnSheet(sheet);
+                var result = rebuildPrintLayoutOnSheet(
+                    sheet,
+                    {
+                        /*
+                         * v1.8.9：用户反复实测“当前工作表”正确、“整个工作簿”错误。
+                         * 整本模式不再另造一套底边计算，直接复用当前表的范围算法；
+                         * 只保留 robustPrintArea 作为批量写入时的 WPS 缓存兜底。
+                         */
+                        strictBottom: false,
+                        robustPrintArea: mode === "workbook"
+                    }
+                );
+
+                /* v1.8.8：若首轮回读仍不一致，整本模式再按活动表强制清空/重写一次。 */
+                if (!result.printAreaVerified && mode === "workbook") {
+                    try {
+                        var expectedAgain = parseSinglePrintArea(result.address);
+                        var rbAgain = applyPrintAreaRobustly(
+                            Application.ActiveSheet,
+                            result.address,
+                            expectedAgain,
+                            true
+                        );
+                        result.printAreaVerified = samePrintBounds(rbAgain.bounds, expectedAgain);
+                        result.printAreaReadSource = rbAgain.source || result.printAreaReadSource;
+                    } catch (ignoredRetryPrintArea) {}
+                }
+
+                /*
+                 * 整本模式只用“新鲜 ActiveSheet + HPageBreaks.Add”补漏，
+                 * 不再使用 v1.8.6 的 Range.PageBreak，也不在核验阶段重新清空分页符。
+                 */
+                if (mode === "workbook" && result.desiredBreakRows) {
+                    var repair = repairWorkbookPageBreaksOnFreshActiveSheet(
+                        sheet,
+                        result.desiredBreakRows,
+                        result.firstColumn
                     );
+                    if (repair.repaired) breakCount += repair.repaired;
+                    if (repair.missing.length) {
+                        pageBreakFailures.push(
+                            "“" + sheetNames[i] + "”：第" + repair.missing.join("、") + "行前分页线仍未写入"
+                        );
+                    }
+
+                    /*
+                     * v1.8.8：整本模式再检查一次“尾页孤行”。
+                     * 用户截图中 PrintArea 底边其实正确，但自动分页线落在“合计”前，
+                     * 使最后一页只剩一行。这里主动把最后一个分页起点向上平衡。
+                     */
+                    try {
+                        try { sheet.EnableCalculation = true; } catch (ignoredEnableCalc) {}
+                        try { sheet.Calculate(); } catch (ignoredTailCalc0) {}
+                        try { Application.Calculate(); } catch (ignoredTailCalc1) {}
+                        refreshPageBreakDisplay(sheet);
+
+                        var tailBounds = parseSinglePrintArea(result.address);
+                        if (tailBounds) {
+                            var tailRepair = repairShortFinalPage(
+                                sheet,
+                                tailBounds,
+                                result.desiredBreakRows,
+                                result.firstColumn
+                            );
+                            if (tailRepair.changed) {
+                                breakCount += 1;
+                                if (tailRepair.fixed) {
+                                    tailBalancedCount += 1;
+                                } else {
+                                    tailBalanceFailures.push(
+                                        "“" + sheetNames[i] + "”：尾页仍只剩" +
+                                        (tailRepair.before ? tailRepair.before.meaningfulCount : "少量") +
+                                        "个有效行，建议人工查看最后一页"
+                                    );
+                                }
+                            } else if (tailRepair.before && !tailRepair.fixed) {
+                                tailBalanceFailures.push(
+                                    "“" + sheetNames[i] + "”：检测到尾页孤行，但未找到安全的前移分页位置"
+                                );
+                            }
+                        }
+                    } catch (tailError) {
+                        tailBalanceFailures.push(
+                            "“" + sheetNames[i] + "”：尾页平衡检查失败：" +
+                            (tailError && tailError.message ? tailError.message : String(tailError))
+                        );
+                    }
+                }
+
+                breakCount += result.breakRows.length;
+                blockCount += Number(result.tableBlocks || 0);
                 completed += 1;
+
+                if (!result.printAreaVerified) {
+                    verifyFailures.push(
+                        "“" + sheetNames[i] + "”：目标底行" + result.bottomRow +
+                        "，WPS回读PrintArea仍未与目标一致"
+                    );
+                }
 
                 if (examples.length < 8) {
                     examples.push(
-                        "“" + sheetNames[i] +
-                        "”：表格块" +
-                        result.tableBlocks +
-                        "个，底行" +
-                        result.bottomRow +
-                        "，分页线" +
-                        result.breakRows.length +
-                        "条"
+                        "“" + sheetNames[i] + "”：表格块" + result.tableBlocks +
+                        "个，底行" + result.bottomRow +
+                        "，目标分页" + (result.desiredBreakRows ? result.desiredBreakRows.length : result.breakRows.length) + "处" +
+                        (result.printAreaVerified ? "，打印范围已核验" : "，打印范围待人工核对")
                     );
                 }
             } catch (error) {
                 failures.push(
-                    "“" + sheetNames[i] +
-                    "”：" +
-                    (
-                        error &&
-                        error.message
-                            ? error.message
-                            : String(error)
-                    )
+                    "“" + sheetNames[i] + "”：" +
+                    (error && error.message ? error.message : String(error))
                 );
             }
         }
 
-        restoreActiveSheet(
-            workbook,
-            originalSheetName
-        );
+        restoreActiveSheet(workbook, originalSheetName);
 
         var message =
-            "已重建" + completed +
-            "张工作表，识别" +
-            blockCount +
-            "个连续表格块，重新放置水平分页线" +
-            breakCount + "条。" +
-            "\n没有改变现有打印缩放方式。";
+            "已重建" + completed + "张工作表，识别" + blockCount +
+            "个连续表格块，写入/补写水平分页线" + breakCount + "次。" +
+            "\n没有改变现有打印缩放方式。" +
+            (mode === "workbook"
+                ? "\n整本模式使用：逐张复用当前表范围算法 → 写入 PrintArea → 逐行读取实际 PageBreak 蓝线 → 清除错误尾部分页 → 尾页平衡。"
+                : "\n当前工作表已恢复使用 v1.8.5 的稳定分页写入路径。");
 
-        if (examples.length) {
-            message +=
-                "\n\n" +
-                examples.join("\n");
+        if (examples.length) message += "\n\n" + examples.join("\n");
+        if (verifyFailures.length) {
+            message += "\n\n需要人工核对的打印范围：" + verifyFailures.length + "张。";
         }
-
+        if (tailBalancedCount) {
+            message += "\n\n已自动平衡" + tailBalancedCount + "张尾页孤行/合计单独成页。";
+        }
+        if (pageBreakFailures.length) {
+            message += "\n\n仍缺少目标分页线：" + pageBreakFailures.length + "张。\n" +
+                pageBreakFailures.slice(0, 10).join("\n");
+        }
+        if (tailBalanceFailures.length) {
+            message += "\n\n尾页仍需人工核对：" + tailBalanceFailures.length + "张。\n" +
+                tailBalanceFailures.slice(0, 10).join("\n");
+        }
         if (failures.length) {
-            message +=
-                "\n\n失败：\n" +
-                failures
-                    .slice(0, 12)
-                    .join("\n");
-            MsgBox(
-                message,
-                JS_EXCLAMATION,
-                completed
-                    ? "部分完成"
-                    : "处理失败"
-            );
+            message += "\n\n失败：\n" + failures.slice(0, 12).join("\n");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, completed ? "部分完成" : "处理失败");
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
-                JS_INFORMATION,
+                (verifyFailures.length || pageBreakFailures.length || tailBalanceFailures.length) ? JS_EXCLAMATION : JS_INFORMATION,
                 "打印布局重建完成"
             );
         }
     }
-
 
     function getSelectedRowSpanForSheet(sheet) {
         try {
@@ -3333,7 +4236,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         );
 
         if (!total) {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 mode === "sheet"
                     ? "没有识别到可安全合并的短尾页表头。" +
                       "\n可选中表名行中的任意单元格，" +
@@ -3359,7 +4262,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                   "行。\n\n是否删除并合并到上一页？";
 
         if (
-            MsgBox(
+            工程表清理_安全MsgBox(
                 confirmText,
                 JS_YES_NO + JS_QUESTION,
                 "清理重复分页表头"
@@ -3443,7 +4346,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                 "\n失败：" +
                 failures.length +
                 "项。";
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_EXCLAMATION,
                 deleted
@@ -3451,7 +4354,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                     : "处理失败"
             );
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_INFORMATION,
                 "清理完成"
@@ -3486,7 +4389,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             if (sheetNameMatches(name, tokens)) matched.push(name);
         }
         if (!matched.length) {
-            MsgBox("没有匹配的工作表。", JS_INFORMATION, "没有匹配项");
+            工程表清理_安全MsgBox("没有匹配的工作表。", JS_INFORMATION, "没有匹配项");
             return;
         }
         var remaining = 0;
@@ -3494,7 +4397,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         if (matched.length >= remaining) throw new Error("不能删除工作簿中的全部普通工作表。");
         var preview = matched.slice(0, 20).join("\n");
         if (matched.length > 20) preview += "\n……另有" + (matched.length - 20) + "张";
-        if (MsgBox("将删除" + matched.length + "张工作表：\n\n" + preview + "\n\n是否继续？", JS_YES_NO + JS_QUESTION, "批量删除工作表") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("将删除" + matched.length + "张工作表：\n\n" + preview + "\n\n是否继续？", JS_YES_NO + JS_QUESTION, "批量删除工作表") !== JS_RESULT_YES) return;
         createUndoPoint(workbook, matched, "批量删除工作表");
         var oldAlerts = Application.DisplayAlerts;
         var deleted = 0;
@@ -3522,8 +4425,8 @@ function 工程表清理_内部执行(action, scopeMode) {
         var message = "已删除" + deleted + "张工作表。";
         if (failures.length) {
             message += "\n\n失败：\n" + failures.slice(0, 12).join("\n");
-            MsgBox(message, JS_EXCLAMATION, "部分完成");
-        } else MsgBox(message, JS_INFORMATION, "删除完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分完成");
+        } else 工程表清理_安全MsgBox(message, JS_INFORMATION, "删除完成");
     }
 
     function findWorksheet(workbook, sheetName) {
@@ -3539,7 +4442,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var sheets = [];
         for (var i = 1; i <= workbook.Worksheets.Count; i += 1) {
             var sheet = workbook.Worksheets.Item(i);
-            if (String(sheet.Name) === PREVIEW_SHEET_NAME) continue;
+            if (isAssistantInternalSheetName(String(sheet.Name))) continue;
             sheets.push(sheet);
         }
         return sheets;
@@ -3618,21 +4521,31 @@ function 工程表清理_内部执行(action, scopeMode) {
 
     function chooseHeaderInteractive(matches, keyword, sheetName) {
         if (matches.length === 1) return matches[0];
-        var lines = [];
-        var displayCount = Math.min(matches.length, 30);
-        for (var i = 0; i < displayCount; i += 1) {
-            lines.push((i + 1) + ". " + matches[i].address + "  " + matches[i].text);
-        }
-        if (matches.length > displayCount) lines.push("……另有 " + (matches.length - displayCount) + " 个匹配未列出");
-        var answer = InputBox(
-            "工作表：“" + sheetName + "”\n找到多个包含“" + keyword + "”的单元格：\n\n" +
-            lines.join("\n") + "\n\n请输入要使用的序号（1-" + displayCount + "）：",
-            "选择判断列",
-            "1"
+
+        var picked = pickSingleCellWithRangeInputBox(
+            "工作表：“" + sheetName + "”中找到多个包含“" + keyword + "”的标题候选。" +
+            "\n\n请直接点选你真正要使用的那个标题单元格，然后点“确定”。",
+            "选择判断列"
         );
-        var index = Number(answer);
-        if (!isFinite(index) || Math.floor(index) !== index || index < 1 || index > displayCount) return null;
-        return matches[index - 1];
+        if (!picked) return null;
+
+        var pickedRow = Number(picked.Row);
+        var pickedColumn = Number(picked.Column);
+        for (var i = 0; i < matches.length; i += 1) {
+            if (
+                Number(matches[i].row) === pickedRow &&
+                Number(matches[i].column) === pickedColumn
+            ) {
+                return matches[i];
+            }
+        }
+
+        工程表清理_安全MsgBox(
+            "你选择的单元格不是本次“" + keyword + "”的标题候选。\n请重新运行并点选候选标题。",
+            JS_EXCLAMATION,
+            "未选择候选标题"
+        );
+        return null;
     }
 
     function chooseHeaderAutomatically(matches, keyword, bounds) {
@@ -3662,7 +4575,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var preview = findWorksheet(workbook, PREVIEW_SHEET_NAME);
         if (!preview) return true;
         if (askFirst) {
-            var replace = MsgBox(
+            var replace = 工程表清理_安全MsgBox(
                 "当前工作簿已经存在“" + PREVIEW_SHEET_NAME + "”。\n是否删除旧预览并重新生成？",
                 JS_YES_NO + JS_QUESTION,
                 "替换删除预览"
@@ -3781,7 +4694,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var context = getTargetContext(true);
         var preview = findWorksheet(context.workbook, PREVIEW_SHEET_NAME);
         if (!preview) {
-            MsgBox("当前工作簿没有删除预览。", JS_EXCLAMATION, "找不到预览");
+            工程表清理_安全MsgBox("当前工作簿没有删除预览。", JS_EXCLAMATION, "找不到预览");
             return;
         }
         var bounds = getUsedBounds(preview);
@@ -3792,7 +4705,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             preview.Cells.Item(row, 1).Value2 = markText;
             changed += 1;
         }
-        MsgBox("已将" + changed + "个候选行设置为“" + markText + "”。", JS_INFORMATION, "预览选择");
+        工程表清理_安全MsgBox("已将" + changed + "个候选行设置为“" + markText + "”。", JS_INFORMATION, "预览选择");
     }
 
     function locatePreviewRow() {
@@ -3800,12 +4713,12 @@ function 工程表清理_内部执行(action, scopeMode) {
         var workbook = context.workbook;
         var preview = findWorksheet(workbook, PREVIEW_SHEET_NAME);
         if (!preview || String(Application.ActiveSheet.Name) !== PREVIEW_SHEET_NAME) {
-            MsgBox("请先切换到“" + PREVIEW_SHEET_NAME + "”，选中一条候选记录。", JS_EXCLAMATION, "定位原行");
+            工程表清理_安全MsgBox("请先切换到“" + PREVIEW_SHEET_NAME + "”，选中一条候选记录。", JS_EXCLAMATION, "定位原行");
             return;
         }
         var row = Number(Application.ActiveCell.Row);
         if (row < PREVIEW_DATA_START_ROW) {
-            MsgBox("请选中预览表中的候选记录行。", JS_EXCLAMATION, "定位原行");
+            工程表清理_安全MsgBox("请选中预览表中的候选记录行。", JS_EXCLAMATION, "定位原行");
             return;
         }
         var sheetName = normalizeText(preview.Cells.Item(row, 2).Value2);
@@ -3813,7 +4726,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var headerColumn = Number(preview.Cells.Item(row, 11).Value2);
         var sheet = findWorksheet(workbook, sheetName);
         if (!sheet || !isFinite(originalRow) || originalRow < 1) {
-            MsgBox("无法定位该记录对应的原工作表行。", JS_EXCLAMATION, "定位失败");
+            工程表清理_安全MsgBox("无法定位该记录对应的原工作表行。", JS_EXCLAMATION, "定位失败");
             return;
         }
         sheet.Activate();
@@ -4247,7 +5160,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var total =
             internalTotal + trailingTotal;
         if (!total) {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "所选范围没有需要清理的完全空白行。" +
                 (
                     scanFailures.length
@@ -4272,7 +5185,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             trailingTotal + "行";
 
         if (
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "处理范围：" +
                 (
                     mode === "workbook"
@@ -4425,7 +5338,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                 failures
                     .slice(0, 12)
                     .join("\n");
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_EXCLAMATION,
                 internalDeleted ||
@@ -4434,7 +5347,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                     : "处理失败"
             );
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_INFORMATION,
                 "清理完成"
@@ -4497,11 +5410,106 @@ function 工程表清理_内部执行(action, scopeMode) {
         return detectChineseMajorRow(sheet, row, bounds);
     }
 
+    function getSelectedCellTextForPrompt() {
+        var text = "";
+        try {
+            var selection = Application.Selection;
+            if (!selection) return "";
+            var rowCount = Number(selection.Rows.Count);
+            var columnCount = Number(selection.Columns.Count);
+            if (rowCount !== 1 || columnCount !== 1) return "";
+            text = normalizeText(readMergedAwareValue(selection.Cells.Item(1, 1)));
+        } catch (ignored0) {
+            try {
+                text = normalizeText(readMergedAwareValue(Application.ActiveCell));
+            } catch (ignored1) {}
+        }
+        if (!text || text.length > 120) return "";
+        return text;
+    }
+
+    function pickSingleCellWithRangeInputBox(promptText, titleText) {
+        /*
+         * WPS 官方 Application.InputBox 的 Type=8 会返回 Range，
+         * 对话框存在时仍允许用户直接在工作表中点选单元格。
+         * 这类“需要从表格取文字/位置”的交互全部优先走范围选择器，
+         * 不再要求用户先选单元格、再点击插件按钮。
+         */
+        try {
+            let defaultRange = Application.ActiveCell;
+            let pickedRange = Application.InputBox(
+                promptText,
+                titleText,
+                defaultRange,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                8
+            );
+            if (
+                pickedRange === null ||
+                pickedRange === undefined ||
+                pickedRange === false
+            ) {
+                return null;
+            }
+
+            var row = Number(pickedRange.Row);
+            var column = Number(pickedRange.Column);
+            if (!isFinite(row) || row < 1 || !isFinite(column) || column < 1) {
+                return null;
+            }
+
+            try {
+                return pickedRange.Cells.Item(1, 1);
+            } catch (ignored0) {
+                return pickedRange;
+            }
+        } catch (ignored1) {
+            return null;
+        }
+    }
+
     function buildBlankColumnPreviewByScope(mode) {
         var context = getTargetContext(false);
         var workbook = context.workbook;
         var originalSheetName = getOriginalActiveSheetName(workbook);
-        var keyword = normalizeText(InputBox("请输入判断列的标题。该列为空且本行有其他内容时，将删除整行。\n例如：金额、费用金额、合计。", "按指定列为空删行", "金额"));
+
+        var pickedHeaderCell = pickSingleCellWithRangeInputBox(
+            "请直接在工作表中点选【判断列的标题单元格】，然后点“确定”。" +
+            "\n\n例如直接点“费用金额（元）”“金额”“合计”等标题。" +
+            "\n此选择框打开期间可以切回工作表并点击单元格。",
+            "按指定列为空删行：选择标题"
+        );
+        if (!pickedHeaderCell) return;
+
+        if (mode === "sheet") {
+            try { context.sheet = Application.ActiveSheet; } catch (ignoredSheet0) {}
+        }
+        originalSheetName = getOriginalActiveSheetName(workbook);
+
+        var pickedHeaderText = "";
+        var pickedHeaderAddress = "";
+        var pickedHeaderRow = Number(pickedHeaderCell.Row);
+        var pickedHeaderColumn = Number(pickedHeaderCell.Column);
+        try {
+            pickedHeaderText = normalizeText(readMergedAwareValue(pickedHeaderCell));
+        } catch (ignored0) {}
+        try {
+            pickedHeaderAddress =
+                String(Application.ActiveSheet.Name) + "!" +
+                String(pickedHeaderCell.Address);
+        } catch (ignored1) {}
+
+        var keyword = normalizeText(InputBox(
+            "已选择：" + (pickedHeaderAddress || "标题单元格") +
+            "\n识别文字：“" + clipPromptText(pickedHeaderText, 80) + "”" +
+            "\n\n下面的关键词可直接修改。" +
+            "\n整个工作簿处理时，如果不同工作表标题略有差异，可把“费用金额（元）”改短为“金额”。",
+            "确认判断列关键词",
+            pickedHeaderText || "金额"
+        ));
         if (!keyword) return;
         var oldPreview = findWorksheet(workbook, PREVIEW_SHEET_NAME);
         if (oldPreview) {
@@ -4523,7 +5531,24 @@ function 工程表清理_内部执行(action, scopeMode) {
                 if (!contentRows) continue;
                 var matches = findHeaderCells(sheet, keyword, bounds);
                 if (!matches.length) continue;
-                var selected = mode === "sheet" ? chooseHeaderInteractive(matches, keyword, sheetNames[i]) : chooseHeaderAutomatically(matches, keyword, bounds);
+
+                var selected = null;
+                if (mode === "sheet") {
+                    for (var pickedIndex = 0; pickedIndex < matches.length; pickedIndex += 1) {
+                        if (
+                            Number(matches[pickedIndex].row) === Number(pickedHeaderRow) &&
+                            Number(matches[pickedIndex].column) === Number(pickedHeaderColumn)
+                        ) {
+                            selected = matches[pickedIndex];
+                            break;
+                        }
+                    }
+                    if (!selected) {
+                        selected = chooseHeaderInteractive(matches, keyword, sheetNames[i]);
+                    }
+                } else {
+                    selected = chooseHeaderAutomatically(matches, keyword, bounds);
+                }
                 if (!selected) continue;
                 var headers = expandRepeatedHeaders(matches, selected);
                 var rowMap = {};
@@ -4554,10 +5579,10 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         restoreActiveSheet(workbook, originalSheetName);
         if (!total) {
-            MsgBox("没有发现“" + keyword + "”列为空且本行有内容的可删除行。\n中文大项保护：" + protectedTotal + "行。" + (failures.length ? "\n\n未检查：\n" + failures.slice(0, 12).join("\n") : ""), failures.length ? JS_EXCLAMATION : JS_INFORMATION, "没有可删除行");
+            工程表清理_安全MsgBox("没有发现“" + keyword + "”列为空且本行有内容的可删除行。\n中文大项保护：" + protectedTotal + "行。" + (failures.length ? "\n\n未检查：\n" + failures.slice(0, 12).join("\n") : ""), failures.length ? JS_EXCLAMATION : JS_INFORMATION, "没有可删除行");
             return;
         }
-        if (MsgBox("处理范围：" + (mode === "workbook" ? "整个工作簿" : "当前工作表") + "\n判断列：“" + keyword + "”\n检测到" + total + "个待删除行，涉及" + plans.length + "张工作表。\n中文大项保留：" + protectedTotal + "行。\n操作会自动清理尾页残留表头并对齐底部蓝线。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "按指定列为空删行") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("处理范围：" + (mode === "workbook" ? "整个工作簿" : "当前工作表") + "\n判断列：“" + keyword + "”\n检测到" + total + "个待删除行，涉及" + plans.length + "张工作表。\n中文大项保留：" + protectedTotal + "行。\n操作会自动清理尾页残留表头并对齐底部蓝线。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "按指定列为空删行") !== JS_RESULT_YES) return;
         createUndoPoint(workbook, plans.map(function (item) { return item.sheetName; }), "按指定列为空删行");
         runStableRewriteSelfTest(workbook);
         var deleted = 0;
@@ -4580,13 +5605,13 @@ function 工程表清理_内部执行(action, scopeMode) {
         if (orphanDeleted) message += "\n另清理尾页残留表头：" + orphanDeleted + "行。";
         if (failures.length) {
             message += "\n\n未完成：\n" + failures.slice(0, 18).join("\n");
-            MsgBox(message, JS_EXCLAMATION, deleted ? "部分完成" : "处理失败");
-        } else MsgBox(message, JS_INFORMATION, "处理完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, deleted ? "部分完成" : "处理失败");
+        } else 工程表清理_安全MsgBox(message, JS_INFORMATION, "处理完成");
     }
 
 
     function executePreviewDelete() {
-        MsgBox("v1.8.0 已取消删除预览表。请直接使用【按指定列为空删行】。", JS_INFORMATION, "功能已简化");
+        工程表清理_安全MsgBox("v1.8.8 已取消删除预览表。请直接使用【按指定列为空删行】。", JS_INFORMATION, "功能已简化");
     }
 
 
@@ -4770,11 +5795,11 @@ function 工程表清理_内部执行(action, scopeMode) {
             if (skipped.length) {
                 noChange += "\n\n跳过：" + skipped.slice(0, 12).join("、");
             }
-            MsgBox(noChange, JS_INFORMATION, "中文大项无需修改");
+            工程表清理_安全MsgBox(noChange, JS_INFORMATION, "中文大项无需修改");
             return;
         }
 
-        if (MsgBox(
+        if (工程表清理_安全MsgBox(
             "检测到" + totalChanges + "处中文大项需要修正，涉及" + plans.length + "张工作表。\n" +
             "同名内容将使用相同中文序号。\n\n是否继续？",
             JS_YES_NO + JS_QUESTION,
@@ -4835,9 +5860,9 @@ function 工程表清理_内部执行(action, scopeMode) {
 
         if (failures.length) {
             message += "\n\n失败：\n" + failures.slice(0, 12).join("\n");
-            MsgBox(message, JS_EXCLAMATION, "部分完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分完成");
         } else {
-            MsgBox(message, JS_INFORMATION, "操作完成");
+            工程表清理_安全MsgBox(message, JS_INFORMATION, "操作完成");
         }
     }
 
@@ -4845,366 +5870,436 @@ function 工程表清理_内部执行(action, scopeMode) {
     function parseNumericSerial(value) {
         var text = normalizeText(value).replace(/[．。]/g, ".").replace(/\s+/g, "");
         if (!/^\d+(?:\.\d+)*$/.test(text)) return null;
-        var parts = text.split(".");
-        return { text: text, parts: parts };
+        var rawParts = text.split(".");
+        var parts = [];
+        for (var i = 0; i < rawParts.length; i += 1) {
+            var valueNumber = Number(rawParts[i]);
+            if (!isFinite(valueNumber) || valueNumber < 0 || Math.floor(valueNumber) !== valueNumber) return null;
+            parts.push(String(valueNumber));
+        }
+        return { text: text, parts: parts, depth: parts.length };
+    }
+
+    function numericSerialParentKey(parsed) {
+        if (!parsed || !parsed.parts || parsed.parts.length <= 1) return "";
+        return parsed.parts.slice(0, parsed.parts.length - 1).join(".");
+    }
+
+    function numericProfileCellKind(cell, rowNumber) {
+        var writable = getWritableMergedTopLeft(cell);
+        if (cellHasFormula(writable)) return "F";
+        var value = readOwnRowValue(cell, rowNumber);
+        if (isBlankValue(value)) return "0";
+        if (typeof value === "number") return "N";
+        var text = normalizeText(value);
+        if (/^[+\-]?[\d,，.]+(?:%|％)?$/.test(text)) return "N";
+        return "T";
+    }
+
+    function getNumericRowProfile(sheet, rowNumber, serialColumn, bounds) {
+        var lastColumn = Math.min(bounds.lastColumn, serialColumn + 14);
+        var kinds = [];
+        var occupied = [];
+        var nonBlankCount = 0;
+        var firstTextCell = null;
+
+        for (var column = serialColumn + 1; column <= lastColumn; column += 1) {
+            var cell = sheet.Cells.Item(rowNumber, column);
+            var kind = numericProfileCellKind(cell, rowNumber);
+            kinds.push(kind);
+            occupied.push(kind === "0" ? "0" : "1");
+            if (kind !== "0") nonBlankCount += 1;
+            if (!firstTextCell && kind === "T") {
+                firstTextCell = getWritableMergedTopLeft(cell);
+            }
+        }
+
+        var profile = {
+            kinds: kinds.join(""),
+            occupied: occupied.join(""),
+            nonBlankCount: nonBlankCount,
+            indent: 0,
+            bold: false,
+            fontSize: 0,
+            mergeColumns: 1
+        };
+
+        if (firstTextCell) {
+            try { profile.indent = Number(firstTextCell.IndentLevel) || 0; } catch (ignored0) {}
+            try { profile.bold = !!firstTextCell.Font.Bold; } catch (ignored1) {}
+            try { profile.fontSize = Number(firstTextCell.Font.Size) || 0; } catch (ignored2) {}
+            try {
+                if (firstTextCell.MergeCells) {
+                    profile.mergeColumns = Number(firstTextCell.MergeArea.Columns.Count) || 1;
+                }
+            } catch (ignored3) {}
+        }
+        return profile;
+    }
+
+    function numericProfilesSimilarity(left, right) {
+        if (!left || !right) return 0;
+        var length = Math.max(left.occupied.length, right.occupied.length);
+        var union = 0;
+        var intersection = 0;
+        var shared = 0;
+        var sameType = 0;
+
+        for (var i = 0; i < length; i += 1) {
+            var lo = left.occupied.charAt(i) === "1";
+            var ro = right.occupied.charAt(i) === "1";
+            if (lo || ro) union += 1;
+            if (lo && ro) {
+                intersection += 1;
+                shared += 1;
+                if (left.kinds.charAt(i) === right.kinds.charAt(i)) sameType += 1;
+            }
+        }
+
+        var score = 0;
+        if (union === 0) score += 40;
+        else score += 55 * intersection / union;
+        if (shared > 0) score += 20 * sameType / shared;
+        if (Number(left.indent) === Number(right.indent)) score += 10;
+        if (!!left.bold === !!right.bold) score += 7;
+        if (
+            Number(left.fontSize) > 0 && Number(right.fontSize) > 0 &&
+            Math.abs(Number(left.fontSize) - Number(right.fontSize)) <= 0.6
+        ) score += 5;
+        if (Number(left.mergeColumns) === Number(right.mergeColumns)) score += 3;
+        return Math.round(score);
+    }
+
+    function numericProfileSuggestsChild(parentProfile, childProfile) {
+        if (!parentProfile || !childProfile) return false;
+        if (Number(childProfile.indent) > Number(parentProfile.indent)) return true;
+        if (!!parentProfile.bold && !childProfile.bold) return true;
+        if (Number(childProfile.nonBlankCount) > Number(parentProfile.nonBlankCount)) return true;
+        if (Number(parentProfile.mergeColumns) > Number(childProfile.mergeColumns) + 1) return true;
+        if (
+            Number(parentProfile.fontSize) > 0 && Number(childProfile.fontSize) > 0 &&
+            Number(parentProfile.fontSize) >= Number(childProfile.fontSize) + 1
+        ) return true;
+        return false;
+    }
+
+    function inferNumericSerialLevel(parsed, profile, previousItem, seenOriginal) {
+        var originalDepth = Math.min(Math.max(Number(parsed.depth) || 1, 1), 4);
+        if (!previousItem) return { level: 1, smart: originalDepth !== 1, reason: "首个编号作为一级项" };
+        if (originalDepth === 1) return { level: 1, smart: false, reason: "原编号为一级" };
+
+        var parentKey = numericSerialParentKey(parsed);
+        if (parentKey && seenOriginal[parentKey]) {
+            /* 原编号存在真实父级，优先尊重原层级，只限制一次最多下钻一级。 */
+            var validLevel = originalDepth;
+            if (validLevel > previousItem.level + 1) validLevel = previousItem.level + 1;
+            return {
+                level: Math.min(Math.max(validLevel, 1), 4),
+                smart: validLevel !== originalDepth,
+                reason: validLevel === originalDepth ? "存在原父级编号" : "层级跳跃过大，限制为逐级下钻"
+            };
+        }
+
+        /*
+         * 缺少原父级时（例如 2.1 后直接出现 2.3.1），不能机械保留三级。
+         * - 与上一编号行结构高度相似：判断为同级；
+         * - 上一行明显更像父项：判断为上一行的子级；
+         * - 否则保守保持上一行层级，避免凭空制造不存在的父级。
+         */
+        var similarity = numericProfilesSimilarity(previousItem.profile, profile);
+        if (numericProfileSuggestsChild(previousItem.profile, profile) && previousItem.level < 4) {
+            return {
+                level: previousItem.level + 1,
+                smart: true,
+                reason: "缺少父级编号，但上一行结构更像父项，按其子级处理"
+            };
+        }
+        if (similarity >= 78) {
+            return {
+                level: previousItem.level,
+                smart: true,
+                reason: "缺少父级编号，且与上一行结构相似（" + similarity + "分），按同级处理"
+            };
+        }
+        return {
+            level: previousItem.level,
+            smart: true,
+            reason: "缺少父级编号且结构关系不明确，保守按上一行同级处理"
+        };
+    }
+
+    function buildSmartNumericSerial(items) {
+        /*
+         * 一级编号仍沿用旧版“按原主号首次出现映射”的优点：
+         * 同一张工程表里不同中文分组可能再次从 1 开始，此时不能因为
+         * 前面已经出现过 1 就把第二组的 1 改成 2。
+         * 子级计数则在每次遇到一级行时重新开始。
+         */
+        var mainMap = {};
+        var nextMain = 0;
+        var counters = [0, 0, 0, 0];
+
+        for (var i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            var level = Math.min(Math.max(Number(item.level) || 1, 1), 4);
+            var oldMain = item.parsed && item.parsed.parts && item.parsed.parts.length
+                ? String(Number(item.parsed.parts[0]))
+                : "";
+
+            if (level === 1) {
+                if (!mainMap.hasOwnProperty(oldMain)) {
+                    nextMain += 1;
+                    mainMap[oldMain] = nextMain;
+                }
+                counters[0] = Number(mainMap[oldMain]);
+                counters[1] = 0;
+                counters[2] = 0;
+                counters[3] = 0;
+                item.level = 1;
+                item.expected = String(counters[0]);
+                continue;
+            }
+
+            /*
+             * 极端情况下表格直接从 1.1 开始而没有可见的 1，
+             * 仍为它建立主号映射，避免产生 0.1。
+             */
+            if (counters[0] <= 0) {
+                if (!mainMap.hasOwnProperty(oldMain)) {
+                    nextMain += 1;
+                    mainMap[oldMain] = nextMain;
+                }
+                counters[0] = Number(mainMap[oldMain]);
+            }
+
+            while (level > 1 && counters[level - 2] <= 0) level -= 1;
+            if (level === 1) {
+                item.level = 1;
+                item.expected = String(counters[0]);
+                continue;
+            }
+
+            counters[level - 1] += 1;
+            for (var reset = level; reset < counters.length; reset += 1) counters[reset] = 0;
+
+            var parts = [];
+            for (var p = 0; p < level; p += 1) parts.push(String(counters[p]));
+            item.level = level;
+            item.expected = parts.join(".");
+        }
+        return items;
     }
 
     function renumberNumericItemsByScope(mode) {
         var context = getTargetContext(false);
         var workbook = context.workbook;
-        var originalSheetName =
-            getOriginalActiveSheetName(workbook);
-        var sheetNames = getScopeSheetNames(
-            workbook,
-            context.sheet,
-            mode
-        );
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, mode);
         var plans = [];
         var skipped = [];
         var failures = [];
         var total = 0;
+        var smartTotal = 0;
+        var smartExamples = [];
 
-        for (
-            var i = 0;
-            i < sheetNames.length;
-            i += 1
-        ) {
+        for (var i = 0; i < sheetNames.length; i += 1) {
             try {
-                var sheet = activateWorksheet(
-                    workbook,
-                    sheetNames[i]
-                );
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
                 var bounds = getUsedBounds(sheet);
-                var contentRows =
-                    getActualContentRowBounds(
-                        sheet,
-                        bounds
-                    );
+                var contentRows = getActualContentRowBounds(sheet, bounds);
                 if (!contentRows) continue;
 
-                var headers =
-                    findSerialHeaders(
-                        sheet,
-                        bounds
-                    );
+                var headers = findSerialHeaders(sheet, bounds);
                 if (!headers.length) {
-                    skipped.push(
-                        sheetNames[i] +
-                        "（无序号列）"
-                    );
+                    skipped.push(sheetNames[i] + "（无序号列）");
                     continue;
                 }
 
-                var header =
-                    chooseHeaderAutomatically(
-                        headers,
-                        "序号",
-                        bounds
-                    );
-                var headerCell =
-                    getWritableMergedTopLeft(
-                        sheet.Cells.Item(
-                            header.row,
-                            header.column
-                        )
-                    );
-                var serialColumn =
-                    Number(headerCell.Column);
+                var header = chooseHeaderAutomatically(headers, "序号", bounds);
+                var headerCell = getWritableMergedTopLeft(
+                    sheet.Cells.Item(header.row, header.column)
+                );
+                var serialColumn = Number(headerCell.Column);
+                var seenOriginal = {};
+                var items = [];
+                var previousItem = null;
 
-                var mainMap = {};
-                var nextMain = 0;
-                var changes = [];
+                for (var row = Number(header.row) + 1; row <= contentRows.lastRow; row += 1) {
+                    var sourceCell = sheet.Cells.Item(row, serialColumn);
+                    if (cellHasFormula(getWritableMergedTopLeft(sourceCell))) continue;
 
-                for (
-                    var row =
-                        Number(header.row) + 1;
-                    row <=
-                        contentRows.lastRow;
-                    row += 1
-                ) {
-                    var sourceCell =
-                        sheet.Cells.Item(
-                            row,
-                            serialColumn
-                        );
-                    if (
-                        cellHasFormula(
-                            getWritableMergedTopLeft(
-                                sourceCell
-                            )
-                        )
-                    ) {
-                        continue;
-                    }
-
-                    var parsed =
-                        parseNumericSerial(
-                            readMergedAwareValue(
-                                sourceCell
-                            )
-                        );
+                    var parsed = parseNumericSerial(readMergedAwareValue(sourceCell));
                     if (!parsed) continue;
 
-                    var oldMain = String(
-                        Number(parsed.parts[0])
-                    );
-                    if (
-                        !mainMap.hasOwnProperty(
-                            oldMain
-                        )
-                    ) {
-                        nextMain += 1;
-                        mainMap[oldMain] =
-                            nextMain;
-                    }
+                    /* 新的一级编号代表新的数字分组，父级存在性只在本组内判断。 */
+                    if (Number(parsed.depth) === 1) seenOriginal = {};
 
-                    var expected = String(
-                        mainMap[oldMain]
-                    );
-                    if (
-                        parsed.parts.length > 1
-                    ) {
-                        expected += "." +
-                            parsed.parts
-                                .slice(1)
-                                .join(".");
-                    }
+                    var profile = getNumericRowProfile(sheet, row, serialColumn, bounds);
+                    var inference = inferNumericSerialLevel(parsed, profile, previousItem, seenOriginal);
+                    var item = {
+                        row: row,
+                        column: serialColumn,
+                        original: parsed.text,
+                        parsed: parsed,
+                        profile: profile,
+                        level: inference.level,
+                        smart: inference.smart,
+                        reason: inference.reason,
+                        expected: ""
+                    };
+                    items.push(item);
+                    previousItem = item;
+                    seenOriginal[parsed.parts.join(".")] = true;
+                }
 
-                    if (
-                        parsed.text !== expected
-                    ) {
-                        changes.push({
-                            row: row,
-                            column:
-                                serialColumn,
-                            value: expected,
-                            original:
-                                parsed.text
-                        });
+                buildSmartNumericSerial(items);
+
+                var changes = [];
+                var sheetSmart = 0;
+                for (var n = 0; n < items.length; n += 1) {
+                    var current = items[n];
+                    if (current.original === current.expected) continue;
+                    changes.push({
+                        row: current.row,
+                        column: current.column,
+                        value: current.expected,
+                        original: current.original,
+                        smart: current.smart,
+                        reason: current.reason
+                    });
+                    if (current.smart) {
+                        sheetSmart += 1;
+                        smartTotal += 1;
+                        if (smartExamples.length < 10) {
+                            smartExamples.push(
+                                "“" + sheetNames[i] + "”第" + current.row + "行：" +
+                                current.original + " → " + current.expected +
+                                "（" + current.reason + "）"
+                            );
+                        }
                     }
                 }
 
                 if (changes.length) {
                     plans.push({
-                        sheetName:
-                            sheetNames[i],
-                        changes: changes
+                        sheetName: sheetNames[i],
+                        changes: changes,
+                        smartCount: sheetSmart
                     });
                     total += changes.length;
                 }
             } catch (error) {
                 failures.push(
-                    "“" + sheetNames[i] +
-                    "”：" +
-                    (
-                        error &&
-                        error.message
-                            ? error.message
-                            : String(error)
-                    )
+                    "“" + sheetNames[i] + "”：" +
+                    (error && error.message ? error.message : String(error))
                 );
             }
         }
 
-        restoreActiveSheet(
-            workbook,
-            originalSheetName
-        );
+        restoreActiveSheet(workbook, originalSheetName);
 
         if (!total) {
-            MsgBox(
-                "没有需要修正的数字序号。",
-                JS_INFORMATION,
-                "无需修改"
-            );
+            工程表清理_安全MsgBox("没有需要修正的数字序号。", JS_INFORMATION, "无需修改");
             return;
         }
 
-        if (
-            MsgBox(
-                "检测到" + total +
-                "处数字序号需要修正，涉及" +
-                plans.length +
-                "张工作表。" +
-                "\n首个主项将从1开始，" +
-                "小数后缀保留。" +
-                "\n\n是否继续？",
-                JS_YES_NO + JS_QUESTION,
-                "数字序号顺位"
-            ) !== JS_RESULT_YES
-        ) {
-            return;
+        var confirmText =
+            "检测到" + total + "处数字序号需要修正，涉及" + plans.length + "张工作表。" +
+            "\n将按层级重新顺位，支持 1 / 1.1 / 1.1.1 / 1.1.1.1。" +
+            "\n其中" + smartTotal + "处需要根据“父级是否存在 + 相邻行结构”智能修正层级。";
+        if (smartExamples.length) {
+            confirmText += "\n\n智能判断示例：\n" + smartExamples.slice(0, 6).join("\n");
         }
+        confirmText += "\n\n建议首次在文件副本上测试。是否继续？";
+
+        if (
+            工程表清理_安全MsgBox(
+                confirmText,
+                JS_YES_NO + JS_QUESTION,
+                "智能数字序号顺位"
+            ) !== JS_RESULT_YES
+        ) return;
 
         createUndoPoint(
             workbook,
-            plans.map(function (item) {
-                return item.sheetName;
-            }),
-            "数字序号顺位"
+            plans.map(function (item) { return item.sheetName; }),
+            "智能数字序号顺位"
         );
 
         var changed = 0;
+        var smartChanged = 0;
 
-        for (
-            var p = 0;
-            p < plans.length;
-            p += 1
-        ) {
+        for (var p = 0; p < plans.length; p += 1) {
             var active = null;
             try {
-                active = activateWorksheet(
-                    workbook,
-                    plans[p].sheetName
-                );
+                active = activateWorksheet(workbook, plans[p].sheetName);
             } catch (activateError) {
                 failures.push(
-                    "“" + plans[p].sheetName +
-                    "”：" +
-                    (
-                        activateError &&
-                        activateError.message
-                            ? activateError.message
-                            : String(activateError)
-                    )
+                    "“" + plans[p].sheetName + "”：" +
+                    (activateError && activateError.message ? activateError.message : String(activateError))
                 );
                 continue;
             }
 
-            for (
-                var c = 0;
-                c <
-                    plans[p].changes.length;
-                c += 1
-            ) {
-                var item =
-                    plans[p].changes[c];
+            for (var c = 0; c < plans[p].changes.length; c += 1) {
+                var change = plans[p].changes[c];
                 try {
-                    var originalCell =
-                        active.Cells.Item(
-                            item.row,
-                            item.column
-                        );
-                    var writableCell =
-                        getWritableMergedTopLeft(
-                            originalCell
-                        );
-                    var oldNumberFormat =
-                        null;
-                    try {
-                        oldNumberFormat =
-                            writableCell
-                                .NumberFormat;
-                    } catch (ignored0) {}
+                    var originalCell = active.Cells.Item(change.row, change.column);
+                    var writableCell = getWritableMergedTopLeft(originalCell);
+                    var oldNumberFormat = null;
+                    try { oldNumberFormat = writableCell.NumberFormat; } catch (ignored0) {}
 
                     var written = false;
-
                     try {
-                        writableCell.Value2 =
-                            item.value;
-                        written =
-                            normalizeText(
-                                readMergedAwareValue(
-                                    originalCell
-                                )
-                            ) === item.value;
+                        writableCell.Value2 = change.value;
+                        written = normalizeText(readMergedAwareValue(originalCell)) === change.value;
                     } catch (ignored1) {}
 
                     if (!written) {
+                        try { writableCell.ClearContents(); } catch (ignored2) {}
                         try {
-                            writableCell
-                                .ClearContents();
-                        } catch (ignored2) {}
-                        try {
-                            writableCell.Value =
-                                item.value;
-                            written =
-                                normalizeText(
-                                    readMergedAwareValue(
-                                        originalCell
-                                    )
-                                ) === item.value;
+                            writableCell.Value = change.value;
+                            written = normalizeText(readMergedAwareValue(originalCell)) === change.value;
                         } catch (ignored3) {}
                     }
 
-                    if (
-                        oldNumberFormat !== null
-                    ) {
-                        try {
-                            writableCell
-                                .NumberFormat =
-                                oldNumberFormat;
-                        } catch (ignored4) {}
+                    if (oldNumberFormat !== null) {
+                        try { writableCell.NumberFormat = oldNumberFormat; } catch (ignored4) {}
                     }
 
                     if (!written) {
                         throw new Error(
-                            "第" + item.row +
-                            "行写入后仍为“" +
-                            normalizeText(
-                                readMergedAwareValue(
-                                    originalCell
-                                )
-                            ) +
-                            "”，预计“" +
-                            item.value + "”。"
+                            "第" + change.row + "行写入后仍为“" +
+                            normalizeText(readMergedAwareValue(originalCell)) +
+                            "”，预计“" + change.value + "”。"
                         );
                     }
-
                     changed += 1;
+                    if (change.smart) smartChanged += 1;
                 } catch (writeError) {
                     failures.push(
-                        "“" +
-                        plans[p].sheetName +
-                        "”第" + item.row +
-                        "行：" +
-                        (
-                            writeError &&
-                            writeError.message
-                                ? writeError.message
-                                : String(writeError)
-                        )
+                        "“" + plans[p].sheetName + "”第" + change.row + "行：" +
+                        (writeError && writeError.message ? writeError.message : String(writeError))
                     );
                 }
             }
         }
 
-        restoreActiveSheet(
-            workbook,
-            originalSheetName
-        );
+        restoreActiveSheet(workbook, originalSheetName);
 
         var message =
-            "数字序号顺位完成，共修改" +
-            changed + "处。" +
-            "\n首个主项从1开始，" +
-            "小数后缀原样保留。";
+            "智能数字序号顺位完成，共修改" + changed + "处。" +
+            "\n其中智能层级修正" + smartChanged + "处。" +
+            "\n支持最多4级编号，并在原父级缺失时参考相邻行结构判断同级/子级。";
 
         if (skipped.length) {
-            message +=
-                "\n跳过：" +
-                skipped
-                    .slice(0, 10)
-                    .join("、");
+            message += "\n跳过：" + skipped.slice(0, 10).join("、");
         }
-
         if (failures.length) {
-            message +=
-                "\n\n失败：" +
-                failures.length + "项。";
-            MsgBox(
-                message,
-                JS_EXCLAMATION,
-                changed
-                    ? "部分完成"
-                    : "处理失败"
-            );
+            message += "\n\n失败：" + failures.length + "项。";
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, changed ? "部分完成" : "处理失败");
         } else {
-            MsgBox(
-                message,
-                JS_INFORMATION,
-                "操作完成"
-            );
+            工程表清理_安全MsgBox(message, JS_INFORMATION, "操作完成");
         }
     }
 
@@ -5241,10 +6336,10 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         rows = uniqueSortedRowsDescending(rows);
         if (!rows.length) {
-            MsgBox("选区中没有可移除的空白单元格所在行。\n中文大项保护：" + protectedCount + "行。", JS_INFORMATION, "没有可删除行");
+            工程表清理_安全MsgBox("选区中没有可移除的空白单元格所在行。\n中文大项保护：" + protectedCount + "行。", JS_INFORMATION, "没有可删除行");
             return;
         }
-        if (MsgBox("将直接移除所选空白单元格所在的" + rows.length + "行。\n中文大项保护：" + protectedCount + "行。\n操作会清理尾部残留并对齐底部蓝线。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "删除所选空白格所在行") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("将直接移除所选空白单元格所在的" + rows.length + "行。\n中文大项保护：" + protectedCount + "行。\n操作会清理尾部残留并对齐底部蓝线。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "删除所选空白格所在行") !== JS_RESULT_YES) return;
         createUndoPoint(workbook, [String(sheet.Name)], "删除所选空白格所在行");
         runStableRewriteSelfTest(workbook);
         var active = activateWorksheet(workbook, String(sheet.Name));
@@ -5256,19 +6351,33 @@ function 工程表清理_内部执行(action, scopeMode) {
             var lines = [];
             for (var i = 0; i < result.failedRows.length; i += 1) lines.push("第" + result.failedRows[i].row + "行：" + result.failedRows[i].message);
             message += "\n\n未完成：\n" + lines.slice(0, 15).join("\n");
-            MsgBox(message, JS_EXCLAMATION, result.deleted ? "部分完成" : "处理失败");
-        } else MsgBox(message, JS_INFORMATION, "处理完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, result.deleted ? "部分完成" : "处理失败");
+        } else 工程表清理_安全MsgBox(message, JS_INFORMATION, "处理完成");
     }
 
     function deleteRowsBySelectedTextByScope(mode) {
         var context = getTargetContext(false);
         var workbook = context.workbook;
-        var originalSheetName = getOriginalActiveSheetName(workbook);
-        var selectedCell = Application.ActiveCell;
-        if (!selectedCell) throw new Error("请先选中包含目标文字的单元格。");
+
+        var selectedCell = pickSingleCellWithRangeInputBox(
+            "请直接在工作表中点选【包含目标文字的单元格】，然后点“确定”。" +
+            "\n插件会按该单元格所在列，查找完全相同的文字并删除对应整行。",
+            "按文字删除整行：选择示例"
+        );
+        if (!selectedCell) return;
+
         var selectedText = normalizeText(readMergedAwareValue(selectedCell));
-        if (!selectedText) throw new Error("选中的单元格没有文字。");
+        if (!selectedText) throw new Error("选择的单元格没有文字。");
         var targetColumn = Number(selectedCell.Column);
+
+        /*
+         * Type=8 允许用户在选择框打开时切换工作表。
+         * 当前工作表模式以最终点选所在表为准。
+         */
+        if (mode === "sheet") {
+            try { context.sheet = Application.ActiveSheet; } catch (ignored0) {}
+        }
+        var originalSheetName = getOriginalActiveSheetName(workbook);
         var sheetNames = getScopeSheetNames(workbook, context.sheet, mode);
         var plans = [];
         var total = 0;
@@ -5290,10 +6399,10 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         restoreActiveSheet(workbook, originalSheetName);
         if (!total) {
-            MsgBox("在所选范围的" + columnToLetters(targetColumn) + "列中，没有找到与“" + selectedText + "”完全相同的文字。", JS_INFORMATION, "没有匹配行");
+            工程表清理_安全MsgBox("在所选范围的" + columnToLetters(targetColumn) + "列中，没有找到与“" + selectedText + "”完全相同的文字。", JS_INFORMATION, "没有匹配行");
             return;
         }
-        if (MsgBox("目标文字：“" + selectedText + "”\n检测到" + total + "个匹配行，涉及" + plans.length + "张工作表。\n\n是否删除？", JS_YES_NO + JS_QUESTION, "按选中文字删除整行") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("目标文字：“" + selectedText + "”\n检测到" + total + "个匹配行，涉及" + plans.length + "张工作表。\n\n是否删除？", JS_YES_NO + JS_QUESTION, "按选中文字删除整行") !== JS_RESULT_YES) return;
         createUndoPoint(workbook, plans.map(function (item) { return item.sheetName; }), "按选中文字删除整行");
         runStableRewriteSelfTest(workbook);
         var deleted = 0;
@@ -5313,8 +6422,8 @@ function 工程表清理_内部执行(action, scopeMode) {
         if (orphanDeleted) message += "\n另清理尾页残留表头：" + orphanDeleted + "行。";
         if (failures.length) {
             message += "\n\n未完成：\n" + failures.slice(0, 18).join("\n");
-            MsgBox(message, JS_EXCLAMATION, deleted ? "部分完成" : "处理失败");
-        } else MsgBox(message, JS_INFORMATION, "操作完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, deleted ? "部分完成" : "处理失败");
+        } else 工程表清理_安全MsgBox(message, JS_INFORMATION, "操作完成");
     }
 
 
@@ -5874,29 +6983,40 @@ function 工程表清理_内部执行(action, scopeMode) {
             getTargetContext(false);
         var workbook =
             context.workbook;
-        var activeCell =
-            Application.ActiveCell;
-        var defaultText = "";
 
+        var sampleCell = pickSingleCellWithRangeInputBox(
+            "请直接在工作表中点选一个【包含目标文字的示例单元格】，然后点“确定”。" +
+            "\n\n例如需要清理页码时，可以直接点“第 1 页 共 2 页”的单元格。" +
+            "\n下一步仍可把识别出的完整文字修改成较短关键词，例如改为“第1页”。",
+            "查找并清空文字：选择示例"
+        );
+        if (!sampleCell) return;
+
+        if (mode === "sheet") {
+            try { context.sheet = Application.ActiveSheet; } catch (ignoredSheet1) {}
+        }
+
+        var defaultText = "";
         try {
-            if (activeCell) {
-                defaultText =
-                    normalizeText(
-                        readMergedAwareValue(
-                            activeCell
-                        )
-                    );
-            }
+            defaultText =
+                normalizeText(
+                    readMergedAwareValue(
+                        sampleCell
+                    )
+                );
         } catch (ignored0) {}
 
         var targetText =
             normalizeText(
                 InputBox(
-                    "请输入要查找并清空的文字。" +
+                    "已从所选单元格读取：“" +
+                    clipPromptText(defaultText, 100) +
+                    "”" +
+                    "\n\n请输入最终查找关键词。" +
                     "\n默认采用“包含关键词”匹配，并忽略空格。" +
-                    "\n例如输入“第1页”，可匹配“第 1 页 共 2 页”“第1页共5页”。" +
+                    "\n例如可把“第 1 页 共 2 页”改成“第1页”。" +
                     "\n\n只清空匹配单元格文字，不删除行列或改变表格。",
-                    "输入查找文字",
+                    "确认查找文字",
                     defaultText
                 )
             );
@@ -5941,13 +7061,17 @@ function 工程表清理_内部执行(action, scopeMode) {
 
         var selectedLocation = null;
         try {
-            if (activeCell) {
+            if (sampleCell) {
+                var sampleSheetName = "";
+                try {
+                    sampleSheetName = String(sampleCell.Worksheet.Name);
+                } catch (ignoredSheet0) {
+                    sampleSheetName = String(Application.ActiveSheet.Name);
+                }
                 selectedLocation = {
-                    sheetName: String(
-                        Application.ActiveSheet.Name
-                    ),
-                    row: Number(activeCell.Row),
-                    column: Number(activeCell.Column)
+                    sheetName: sampleSheetName,
+                    row: Number(sampleCell.Row),
+                    column: Number(sampleCell.Column)
                 };
             }
         } catch (ignored1) {}
@@ -5963,7 +7087,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             );
 
         if (!scan.items.length) {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "所选范围没有找到匹配文字：“" +
                 targetText +
                 "”。" +
@@ -6021,7 +7145,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
 
         if (
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "查找文字：“" +
                 clipPromptText(targetText, 90) +
                 "”" +
@@ -6177,7 +7301,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                 "\n未完成或核验异常：" +
                 failures.length +
                 "项。";
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_EXCLAMATION,
                 clearedCount
@@ -6185,7 +7309,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                     : "处理失败"
             );
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_INFORMATION,
                 "文字内容已清空"
@@ -6195,7 +7319,7 @@ function 工程表清理_内部执行(action, scopeMode) {
 
 
     function executeDuplicateSelectionDelete() {
-        MsgBox(
+        工程表清理_安全MsgBox(
             "新版已将查找、选择和清空文字合并到【清除相同文字内容】中。",
             JS_INFORMATION,
             "功能已合并"
@@ -6203,7 +7327,7 @@ function 工程表清理_内部执行(action, scopeMode) {
     }
 
     function locateDuplicateSelectionRow() {
-        MsgBox(
+        工程表清理_安全MsgBox(
             "新版不生成选择工作表，清空文字时不会移动表格，因此不需要定位按钮。",
             JS_INFORMATION,
             "功能已取消"
@@ -6422,7 +7546,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         var originalSheetName = getOriginalActiveSheetName(workbook);
         var sheetNames = getScopeSheetNames(workbook, context.sheet, mode);
         var columnLabel = formatColumnList(columns);
-        if (MsgBox("处理范围：" + (mode === "workbook" ? "整个工作簿（" + sheetNames.length + "张工作表）" : "当前工作表“" + context.sheet.Name + "”") + "\n将删除整列：" + columnLabel + "\n选择来源：" + sourceLabel + "\n\n删除后，每个连续删除区左侧的保留列会吸收被删列宽度，表格总宽度保持不变。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "删除多余列") !== JS_RESULT_YES) return;
+        if (工程表清理_安全MsgBox("处理范围：" + (mode === "workbook" ? "整个工作簿（" + sheetNames.length + "张工作表）" : "当前工作表“" + context.sheet.Name + "”") + "\n将删除整列：" + columnLabel + "\n选择来源：" + sourceLabel + "\n\n删除后，每个连续删除区左侧的保留列会吸收被删列宽度，表格总宽度保持不变。\n\n是否继续？", JS_YES_NO + JS_QUESTION, "删除多余列") !== JS_RESULT_YES) return;
         createUndoPoint(workbook, sheetNames, "删除多余列");
         var completed = 0;
         var mergeCount = 0;
@@ -6442,8 +7566,8 @@ function 工程表清理_内部执行(action, scopeMode) {
         if (mergeCount > 0) message += "\n已重建" + mergeCount + "个合并区域。";
         if (failed.length > 0) {
             message += "\n\n失败：\n" + failed.slice(0, 12).join("\n");
-            MsgBox(message, JS_EXCLAMATION, "部分完成");
-        } else MsgBox(message, JS_INFORMATION, "删除完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分完成");
+        } else 工程表清理_安全MsgBox(message, JS_INFORMATION, "删除完成");
     }
 
     function deleteSelectedColumnsByScope(mode) {
@@ -6451,12 +7575,48 @@ function 工程表清理_内部执行(action, scopeMode) {
     }
 
     function promptDeleteColumnsByLetters() {
-        var specification = InputBox("请输入需要删除的列号或范围。\n示例：C、C,F、H:J", "输入要删除的列", "");
+        var pickedRange = null;
+        try {
+            let defaultRange = Application.Selection || Application.ActiveCell;
+            pickedRange = Application.InputBox(
+                "可以直接在工作表中拖选一段需要删除的列范围，然后点“确定”。" +
+                "\n下一步仍可把自动生成的列号改成 C,F,H:J 这类不连续范围。",
+                "选择/输入要删除的列",
+                defaultRange,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                8
+            );
+        } catch (ignored0) {
+            pickedRange = null;
+        }
+        if (!pickedRange) return;
+
+        var firstColumn = Number(pickedRange.Column);
+        var columnCount = 1;
+        try { columnCount = Number(pickedRange.Columns.Count); } catch (ignored1) {}
+        if (!isFinite(firstColumn) || firstColumn < 1) return;
+        if (!isFinite(columnCount) || columnCount < 1) columnCount = 1;
+
+        var lastColumn = firstColumn + columnCount - 1;
+        var defaultSpecification =
+            firstColumn === lastColumn
+                ? columnToLetters(firstColumn)
+                : columnToLetters(firstColumn) + ":" + columnToLetters(lastColumn);
+
+        var specification = InputBox(
+            "已从选区识别列：“" + defaultSpecification + "”。" +
+            "\n可直接确认，也可修改为 C、C,F、H:J 等格式。",
+            "确认要删除的列",
+            defaultSpecification
+        );
         specification = normalizeText(specification);
         if (!specification) return;
         var mode = promptScope();
         if (!mode) return;
-        return deleteColumnsByScope(mode, parseColumnSpec(specification), "手动输入“" + specification + "”");
+        return deleteColumnsByScope(mode, parseColumnSpec(specification), "选择/输入“" + specification + "”");
     }
 
     function getActualContentBounds(sheet) {
@@ -6526,9 +7686,9 @@ function 工程表清理_内部执行(action, scopeMode) {
         var message = "已调整" + adjusted.length + "张工作表：仅将宽度缩放为1页，保留原打印区域、横向分页线和纵向多页结构。";
         if (failed.length) {
             message += "\n\n失败：\n" + failed.slice(0, 12).join("\n");
-            MsgBox(message, JS_EXCLAMATION, "部分完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分完成");
         } else {
-            MsgBox(message, JS_INFORMATION, "页面宽度已调整");
+            工程表清理_安全MsgBox(message, JS_INFORMATION, "页面宽度已调整");
         }
     }
 
@@ -6651,13 +7811,13 @@ function 工程表清理_内部执行(action, scopeMode) {
                 failures
                     .slice(0, 12)
                     .join("\n");
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_EXCLAMATION,
                 completed ? "部分完成" : "处理失败"
             );
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 protectedSheets.length
                     ? JS_EXCLAMATION
@@ -6691,9 +7851,9 @@ function 工程表清理_内部执行(action, scopeMode) {
         var message = "已将" + changed + "张工作表切换为" + label + "。";
         if (failures.length) {
             message += "\n失败：" + failures.length + "张。";
-            MsgBox(message, JS_EXCLAMATION, "部分完成");
+            工程表清理_安全MsgBox(message, JS_EXCLAMATION, "部分完成");
         } else {
-            MsgBox(message, JS_INFORMATION, "视图切换完成");
+            工程表清理_安全MsgBox(message, JS_INFORMATION, "视图切换完成");
         }
     }
 
@@ -7425,6 +8585,33 @@ function 工程表清理_内部执行(action, scopeMode) {
         };
     }
 
+    function textLooksLikeTableMetadataLine(
+        value
+    ) {
+        var text = normalizeText(value).replace(/\s+/g, "");
+        if (!text) return false;
+
+        /*
+         * 工程表常见的第二行是横向合并的“工程名称：……”等说明。
+         * 它虽然很宽，但不是新表标题，绝不能作为手动分页起点。
+         */
+        return /^(工程名称|项目名称|单项工程名称|单位工程名称|专业名称|工程编号|项目编号|合同编号|标段名称|工程地点|项目地点|建设单位|施工单位|编制单位|审核单位|编制人|审核人|编制日期|审核日期|日期)[：:]?/.test(text);
+    }
+
+    function textLooksLikeTableSummaryLine(
+        value
+    ) {
+        var text = normalizeText(value).replace(/\s+/g, "");
+        if (!text) return false;
+
+        /*
+         * v1.9.2：表尾“合 计 / 总 计 / 小 计”等经常横向合并，
+         * v1.9.1 会把它们误当成第二个宽表名，从而在合计行前写入手动分页。
+         * 这里只排除“纯汇总标签”，不会误伤“措施项目计算汇总表”这类真实标题。
+         */
+        return /^(合计|总计|小计|累计|本页合计|本页小计|本期合计|本期小计|本表合计|其中|合计金额|总计金额)(?:[（(][^）)]*[）)])?[：:]?$/.test(text);
+    }
+
     function rowIsWideTableTitle(
         sheet,
         rowNumber,
@@ -7474,9 +8661,12 @@ function 工程表清理_内部执行(action, scopeMode) {
                         cell
                     )
                 );
+            var compactText = text.replace(/\s+/g, "");
             if (
-                text &&
-                text.length >= 4
+                compactText &&
+                compactText.length >= 4 &&
+                !textLooksLikeTableMetadataLine(text) &&
+                !textLooksLikeTableSummaryLine(text)
             ) {
                 return true;
             }
@@ -7709,6 +8899,47 @@ function 工程表清理_内部执行(action, scopeMode) {
         return result;
     }
 
+    function conservativeBoundaryTarget(
+        refs,
+        isOuter,
+        innerWeight
+    ) {
+        /*
+         * v1.8.4 保守线宽策略：
+         * - 内部线统一为细线；
+         * - 外圈不再因为“被识别为外框”就主动加粗；
+         * - 只有同一段边界的所有可见实现本来就都比细线粗时，
+         *   才保留其中较细的原有粗线级别；
+         * - 只要同一段有任一侧原本是细线，就统一回细线。
+         *
+         * 这样可以修复“识别错表格块后把右边/底边等多余线变粗”的问题，
+         * 同时不新增原本不存在的边框。
+         */
+        if (!isOuter) return innerWeight;
+        if (!refs || !refs.length) return innerWeight;
+
+        var chosenWeight = null;
+        var chosenRank = Infinity;
+        for (var i = 0; i < refs.length; i += 1) {
+            var weight = Number(refs[i].weight);
+            if (!isFinite(weight)) {
+                try { weight = Number(refs[i].border.Weight); } catch (ignored0) {}
+            }
+            if (!isFinite(weight)) weight = innerWeight;
+
+            var rank = borderWeightRank(weight);
+            if (rank <= borderWeightRank(innerWeight)) {
+                return innerWeight;
+            }
+            if (rank < chosenRank) {
+                chosenRank = rank;
+                chosenWeight = weight;
+            }
+        }
+
+        return chosenWeight === null ? innerWeight : chosenWeight;
+    }
+
     function collectHorizontalBoundaryRefs(
         sheet,
         block,
@@ -7797,27 +9028,33 @@ function 工程表清理_内部执行(action, scopeMode) {
                 boundaryRow <= block.lastRow + 1;
                 boundaryRow += 1
             ) {
-                var horizontalTarget =
+                var horizontalOuter =
                     (
                         boundaryRow === block.firstRow ||
                         boundaryRow === block.lastRow + 1
-                    )
-                        ? outerWeight
-                        : innerWeight;
+                    );
 
                 for (
                     var column = block.firstColumn;
                     column <= block.lastColumn;
                     column += 1
                 ) {
+                    var horizontalRefs =
+                        collectHorizontalBoundaryRefs(
+                            sheet,
+                            block,
+                            boundaryRow,
+                            column
+                        );
+                    var horizontalTarget =
+                        conservativeBoundaryTarget(
+                            horizontalRefs,
+                            horizontalOuter,
+                            innerWeight
+                        );
                     var horizontal =
                         applyBoundaryRefs(
-                            collectHorizontalBoundaryRefs(
-                                sheet,
-                                block,
-                                boundaryRow,
-                                column
-                            ),
+                            horizontalRefs,
                             horizontalTarget
                         );
                     totals.checked += horizontal.checked;
@@ -7831,27 +9068,33 @@ function 工程表清理_内部执行(action, scopeMode) {
                 boundaryColumn <= block.lastColumn + 1;
                 boundaryColumn += 1
             ) {
-                var verticalTarget =
+                var verticalOuter =
                     (
                         boundaryColumn === block.firstColumn ||
                         boundaryColumn === block.lastColumn + 1
-                    )
-                        ? outerWeight
-                        : innerWeight;
+                    );
 
                 for (
                     var row = block.firstRow;
                     row <= block.lastRow;
                     row += 1
                 ) {
+                    var verticalRefs =
+                        collectVerticalBoundaryRefs(
+                            sheet,
+                            block,
+                            row,
+                            boundaryColumn
+                        );
+                    var verticalTarget =
+                        conservativeBoundaryTarget(
+                            verticalRefs,
+                            verticalOuter,
+                            innerWeight
+                        );
                     var vertical =
                         applyBoundaryRefs(
-                            collectVerticalBoundaryRefs(
-                                sheet,
-                                block,
-                                row,
-                                boundaryColumn
-                            ),
+                            verticalRefs,
                             verticalTarget
                         );
                     totals.checked += vertical.checked;
@@ -7862,6 +9105,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         return totals;
     }
+
 
     function normalizeMergedAreasByBlocks(
         sheet,
@@ -7919,36 +9163,45 @@ function 工程表清理_内部执行(action, scopeMode) {
                     i += 1
                 ) {
                     var borderIndex = indexes[i];
-                    var target = innerWeight;
+                    var isOuter = false;
                     if (
                         borderIndex === 7 &&
                         descriptor.firstColumn === block.firstColumn
                     ) {
-                        target = outerWeight;
+                        isOuter = true;
                     } else if (
                         borderIndex === 10 &&
                         descriptor.lastColumn === block.lastColumn
                     ) {
-                        target = outerWeight;
+                        isOuter = true;
                     } else if (
                         borderIndex === 8 &&
                         descriptor.firstRow === block.firstRow
                     ) {
-                        target = outerWeight;
+                        isOuter = true;
                     } else if (
                         borderIndex === 9 &&
                         descriptor.lastRow === block.lastRow
                     ) {
-                        target = outerWeight;
+                        isOuter = true;
                     }
+
+                    var refs =
+                        collectMergedEdgeBorderRefs(
+                            sheet,
+                            descriptor,
+                            borderIndex
+                        );
+                    var target =
+                        conservativeBoundaryTarget(
+                            refs,
+                            isOuter,
+                            innerWeight
+                        );
 
                     var current =
                         applyBoundaryRefs(
-                            collectMergedEdgeBorderRefs(
-                                sheet,
-                                descriptor,
-                                borderIndex
-                            ),
+                            refs,
                             target
                         );
                     totals.checked += current.checked;
@@ -7959,6 +9212,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         }
         return totals;
     }
+
 
     function verifyBorderBlocks(
         sheet,
@@ -7981,13 +9235,11 @@ function 工程表清理_内部执行(action, scopeMode) {
                 boundaryRow <= block.lastRow + 1;
                 boundaryRow += 1
             ) {
-                var horizontalTarget =
+                var horizontalOuter =
                     (
                         boundaryRow === block.firstRow ||
                         boundaryRow === block.lastRow + 1
-                    )
-                        ? outerWeight
-                        : innerWeight;
+                    );
                 for (
                     var column = block.firstColumn;
                     column <= block.lastColumn;
@@ -7999,6 +9251,12 @@ function 工程表清理_内部执行(action, scopeMode) {
                             block,
                             boundaryRow,
                             column
+                        );
+                    var horizontalTarget =
+                        conservativeBoundaryTarget(
+                            hRefs,
+                            horizontalOuter,
+                            innerWeight
                         );
                     for (
                         var h = 0;
@@ -8025,13 +9283,11 @@ function 工程表清理_内部执行(action, scopeMode) {
                 boundaryColumn <= block.lastColumn + 1;
                 boundaryColumn += 1
             ) {
-                var verticalTarget =
+                var verticalOuter =
                     (
                         boundaryColumn === block.firstColumn ||
                         boundaryColumn === block.lastColumn + 1
-                    )
-                        ? outerWeight
-                        : innerWeight;
+                    );
                 for (
                     var row = block.firstRow;
                     row <= block.lastRow;
@@ -8043,6 +9299,12 @@ function 工程表清理_内部执行(action, scopeMode) {
                             block,
                             row,
                             boundaryColumn
+                        );
+                    var verticalTarget =
+                        conservativeBoundaryTarget(
+                            vRefs,
+                            verticalOuter,
+                            innerWeight
                         );
                     for (
                         var v = 0;
@@ -8070,6 +9332,85 @@ function 工程表清理_内部执行(action, scopeMode) {
         };
     }
 
+    function borderRefMatchesTarget(ref, targetWeight) {
+        try {
+            return Number(ref.border.LineStyle) === 1 &&
+                Number(ref.border.Weight) === Number(targetWeight);
+        } catch (ignored) {
+            return false;
+        }
+    }
+
+    function repairOnlyMismatchedRefs(refs, targetWeight) {
+        var result = { checked: 0, changed: 0, failed: 0 };
+        for (var i = 0; i < refs.length; i += 1) {
+            result.checked += 1;
+            if (borderRefMatchesTarget(refs[i], targetWeight)) continue;
+            var current = writeVisibleBorder(refs[i], targetWeight);
+            result.changed += current.changed;
+            result.failed += current.failed;
+        }
+        return result;
+    }
+
+    function repairBorderBlockMismatches(
+        sheet,
+        blocks,
+        outerWeight,
+        innerWeight
+    ) {
+        var totals = { checked: 0, changed: 0, failed: 0 };
+        for (var b = blocks.length - 1; b >= 0; b -= 1) {
+            var block = blocks[b];
+
+            for (var boundaryRow = block.lastRow + 1; boundaryRow >= block.firstRow; boundaryRow -= 1) {
+                var horizontalOuter =
+                    (boundaryRow === block.firstRow || boundaryRow === block.lastRow + 1);
+                for (var column = block.lastColumn; column >= block.firstColumn; column -= 1) {
+                    var hRefs =
+                        collectHorizontalBoundaryRefs(sheet, block, boundaryRow, column);
+                    var horizontalTarget =
+                        conservativeBoundaryTarget(
+                            hRefs,
+                            horizontalOuter,
+                            innerWeight
+                        );
+                    var h = repairOnlyMismatchedRefs(
+                        hRefs,
+                        horizontalTarget
+                    );
+                    totals.checked += h.checked;
+                    totals.changed += h.changed;
+                    totals.failed += h.failed;
+                }
+            }
+
+            for (var boundaryColumn = block.lastColumn + 1; boundaryColumn >= block.firstColumn; boundaryColumn -= 1) {
+                var verticalOuter =
+                    (boundaryColumn === block.firstColumn || boundaryColumn === block.lastColumn + 1);
+                for (var row = block.lastRow; row >= block.firstRow; row -= 1) {
+                    var vRefs =
+                        collectVerticalBoundaryRefs(sheet, block, row, boundaryColumn);
+                    var verticalTarget =
+                        conservativeBoundaryTarget(
+                            vRefs,
+                            verticalOuter,
+                            innerWeight
+                        );
+                    var v = repairOnlyMismatchedRefs(
+                        vRefs,
+                        verticalTarget
+                    );
+                    totals.checked += v.checked;
+                    totals.changed += v.changed;
+                    totals.failed += v.failed;
+                }
+            }
+        }
+        return totals;
+    }
+
+
     function normalizeTableBordersOnSheet(
         sheet
     ) {
@@ -8086,7 +9427,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                 tableBlocks: 0,
                 outerSegments: 0,
                 innerSegments: 0,
-                outerWeight: -4138,
+                outerWeight: 2,
                 innerWeight: 2
             };
         }
@@ -8117,67 +9458,68 @@ function 工程表清理_内部执行(action, scopeMode) {
                 sheet,
                 actual
             );
-        var outerWeight = -4138;
+        /*
+         * v1.8.4：不再强制“外圈=中等线”。
+         * 外圈采用保守保持策略，内部已有线统一为细线。
+         */
+        var outerWeight = 2;
         var innerWeight = 2;
         var checked = 0;
         var changed = 0;
         var failed = 0;
 
         /*
-         * 同一共享边界的两侧一起写入；再处理合并区域；
-         * 最后重复边界修正。这样可消除左格右边和右格左边
-         * 各自保存不同粗细造成的“局部概率失败”。
+         * v1.8.1：先完整同步共享边界和合并区域；
+         * 如最终核验仍有不一致，只反向补写真正失败的边界。
+         * 避免每轮把全部边框重复写多次，同时减少WPS偶发覆盖邻边的问题。
          */
+        var ordinary = normalizeOrdinaryBoundaries(
+            sheet, blocks, outerWeight, innerWeight
+        );
+        checked += ordinary.checked;
+        changed += ordinary.changed;
+        failed += ordinary.failed;
+
+        var merged = normalizeMergedAreasByBlocks(
+            sheet, actual, blocks, outerWeight, innerWeight
+        );
+        checked += merged.checked;
+        changed += merged.changed;
+        failed += merged.failed;
+
+        var verify = verifyBorderBlocks(
+            sheet, blocks, outerWeight, innerWeight
+        );
+
         for (
-            var pass = 0;
-            pass < BORDER_CORRECTIVE_PASSES;
-            pass += 1
+            var repairPass = 0;
+            repairPass < BORDER_REPAIR_PASSES && verify.failed;
+            repairPass += 1
         ) {
-            var ordinary =
-                normalizeOrdinaryBoundaries(
-                    sheet,
-                    blocks,
-                    outerWeight,
-                    innerWeight
-                );
-            checked += ordinary.checked;
-            changed += ordinary.changed;
-            failed += ordinary.failed;
-
-            var merged =
-                normalizeMergedAreasByBlocks(
-                    sheet,
-                    actual,
-                    blocks,
-                    outerWeight,
-                    innerWeight
-                );
-            checked += merged.checked;
-            changed += merged.changed;
-            failed += merged.failed;
-
-            var verifyNow =
-                verifyBorderBlocks(
-                    sheet,
-                    blocks,
-                    outerWeight,
-                    innerWeight
-                );
-            if (!verifyNow.failed) break;
-        }
-
-        var verify =
-            verifyBorderBlocks(
-                sheet,
-                blocks,
-                outerWeight,
-                innerWeight
+            var repaired = repairBorderBlockMismatches(
+                sheet, blocks, outerWeight, innerWeight
             );
+            checked += repaired.checked;
+            changed += repaired.changed;
+            failed += repaired.failed;
+
+            var mergedRepair = normalizeMergedAreasByBlocks(
+                sheet, actual, blocks, outerWeight, innerWeight
+            );
+            checked += mergedRepair.checked;
+            changed += mergedRepair.changed;
+            failed += mergedRepair.failed;
+
+            verify = verifyBorderBlocks(
+                sheet, blocks, outerWeight, innerWeight
+            );
+        }
 
         return {
             changed: changed,
             checkedMerged: checked,
-            failedMerged: failed,
+            attemptFailures: failed,
+            failedMerged: verify.failed,
             verifyFailed: verify.failed,
             tableBlocks: blocks.length,
             outerSegments: 0,
@@ -8218,16 +9560,17 @@ function 工程表清理_内部执行(action, scopeMode) {
             );
 
         if (
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "处理范围：" +
                 (
                     mode === "workbook"
                         ? "整个工作簿"
                         : "当前工作表"
                 ) +
-                "\n将先识别连续表格块：" +
-                "\n• 每个表格块最外一圈统一为中等实线" +
-                "\n• 表格块内部全部已有线统一为细实线" +
+                "\n将先识别连续表格块，并采用保守线宽规则：" +
+                "\n• 表格块内部已有线统一为细实线" +
+                "\n• 外圈不再因为“识别为外框”就自动加粗" +
+                "\n• 外圈只有原本整段已经较粗时才保留原有较粗级别" +
                 "\n• 原本无线的位置不新增边框" +
                 "\n\n是否继续？",
                 JS_YES_NO + JS_QUESTION,
@@ -8314,7 +9657,7 @@ function 工程表清理_内部执行(action, scopeMode) {
             "个连续表格块。" +
             "\n调整已有边框：" +
             changed + "条。" +
-            "\n外圈：中等实线；内部：细实线。" +
+            "\n规则：内部细线；外圈不主动加粗，仅保留原本整段已有的较粗边界。" +
             "\n边框写入检查：" +
             checked + "条；写入失败：" +
             failed + "条。" +
@@ -8332,7 +9675,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                     "\n工作表失败：" +
                     failures.length + "张。";
             }
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_EXCLAMATION,
                 completed
@@ -8340,7 +9683,7 @@ function 工程表清理_内部执行(action, scopeMode) {
                     : "处理失败"
             );
         } else {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 message,
                 JS_INFORMATION,
                 "线宽统一完成"
@@ -8587,6 +9930,20 @@ function 工程表清理_内部执行(action, scopeMode) {
         );
     }
 
+    function textHasCjkOrWideGlyphs(value) {
+        return /[\u2e80-\u9fff\uac00-\ud7af\uff01-\uffee]/.test(
+            String(value || "")
+        );
+    }
+
+    function getCellIndentPoints(area, fontSize) {
+        var indent = 0;
+        try {
+            indent = Number(area.IndentLevel) || 0;
+        } catch (ignored) {}
+        return Math.max(0, indent) * Math.max(2, fontSize * 0.72);
+    }
+
     function inspectPdfTextCell(
         sheet,
         cell,
@@ -8594,34 +9951,21 @@ function 工程表清理_内部执行(action, scopeMode) {
         issues,
         printArea
     ) {
-        var raw =
-            readMergedAwareValue(
-                cell
-            );
+        var raw = readMergedAwareValue(cell);
         var text = normalizeText(raw);
         if (!text) return;
 
         var displayText = "";
         try {
-            displayText =
-                String(cell.Text || "");
+            displayText = String(cell.Text || "");
         } catch (ignored0) {}
 
-        var address =
-            descriptor
-                ? columnToLetters(
-                    descriptor.firstColumn
-                  ) +
-                  descriptor.firstRow +
-                  ":" +
-                  columnToLetters(
-                    descriptor.lastColumn
-                  ) +
-                  descriptor.lastRow
-                : columnToLetters(
-                    Number(cell.Column)
-                  ) +
-                  Number(cell.Row);
+        var address = descriptor
+            ? columnToLetters(descriptor.firstColumn) +
+              descriptor.firstRow + ":" +
+              columnToLetters(descriptor.lastColumn) +
+              descriptor.lastRow
+            : columnToLetters(Number(cell.Column)) + Number(cell.Row);
 
         if (/#{3,}/.test(displayText)) {
             addPdfIssue(
@@ -8634,152 +9978,140 @@ function 工程表清理_内部执行(action, scopeMode) {
             return;
         }
 
-        /*
-         * WPS在部分情况下会让cell.Text只返回当前可见部分。
-         * 文本原值与显示文本明显不同，直接标记为截断风险。
-         */
+        var rawKey = normalizeDisplayCompareText(raw);
+        var displayKey = normalizeDisplayCompareText(displayText);
         if (
             isTextLikeValue(raw) &&
             displayText &&
-            normalizeDisplayCompareText(displayText) !==
-                normalizeDisplayCompareText(raw) &&
-            normalizeDisplayCompareText(displayText).length <
-                normalizeDisplayCompareText(raw).length
+            displayKey !== rawKey &&
+            displayKey.length < rawKey.length
         ) {
             addPdfIssue(
                 issues,
                 String(sheet.Name),
                 address,
-                "当前显示文字比单元格原值短，已出现或接近出现半字/截字",
+                "WPS当前显示文字比单元格原值短，已经存在截字/半字迹象",
                 "明确"
             );
         }
 
-        var area =
-            getCellDisplayArea(
-                cell
-            );
+        var area = getCellDisplayArea(cell);
         var width = 0;
         var height = 0;
-        try {
-            width = Number(area.Width);
-        } catch (ignored1) {}
-        try {
-            height = Number(area.Height);
-        } catch (ignored2) {}
-        if (
-            !isFinite(width) || width <= 0 ||
-            !isFinite(height) || height <= 0
-        ) {
-            return;
-        }
+        try { width = Number(area.Width); } catch (ignored1) {}
+        try { height = Number(area.Height); } catch (ignored2) {}
+        if (!isFinite(width) || width <= 0 || !isFinite(height) || height <= 0) return;
 
-        var fontSize =
-            getCellFontSize(
-                cell
-            );
+        var fontSize = getCellFontSize(cell);
         var wrap = false;
         var shrink = false;
         var orientation = 0;
         var alignment = 0;
-        try {
-            wrap = !!area.WrapText;
-        } catch (ignored3) {}
-        try {
-            shrink = !!area.ShrinkToFit;
-        } catch (ignored4) {}
-        try {
-            orientation =
-                Number(area.Orientation) || 0;
-        } catch (ignored5) {}
-        try {
-            alignment =
-                Number(area.HorizontalAlignment) || 0;
-        } catch (ignored6) {}
+        try { wrap = !!area.WrapText; } catch (ignored3) {}
+        try { shrink = !!area.ShrinkToFit; } catch (ignored4) {}
+        try { orientation = Number(area.Orientation) || 0; } catch (ignored5) {}
+        try { alignment = Number(area.HorizontalAlignment) || 0; } catch (ignored6) {}
         if (orientation !== 0) return;
 
-        var availableWidth =
-            Math.max(4, width - 7);
+        var wideGlyphs = textHasCjkOrWideGlyphs(raw);
+        var indentPoints = getCellIndentPoints(area, fontSize);
+        var availableWidth = Math.max(3, width - 8 - indentPoints);
+        var availableHeight = Math.max(2, height - 1.5);
         var atRightPrintEdge = false;
         var atBottomPrintEdge = false;
         if (printArea) {
-            var lastColumn =
-                descriptor
-                    ? descriptor.lastColumn
-                    : Number(cell.Column);
-            var lastRow =
-                descriptor
-                    ? descriptor.lastRow
-                    : Number(cell.Row);
-            atRightPrintEdge =
-                lastColumn ===
-                Number(printArea.lastColumn);
-            atBottomPrintEdge =
-                lastRow ===
-                Number(printArea.lastRow);
+            var lastColumn = descriptor ? descriptor.lastColumn : Number(cell.Column);
+            var lastRow = descriptor ? descriptor.lastRow : Number(cell.Row);
+            atRightPrintEdge = lastColumn === Number(printArea.lastColumn);
+            atBottomPrintEdge = lastRow === Number(printArea.lastRow);
         }
 
+        /*
+         * v1.8.1：加入“安全余量”而不是只判断已经溢出。
+         * WPS表格界面能完整显示，并不等于PDF字体替换/像素取整后仍有余量。
+         */
         if (wrap) {
-            var lineCount =
-                estimateWrappedLines(
-                    String(raw),
-                    availableWidth * 0.92,
-                    fontSize * 1.08
+            var widthSafety = wideGlyphs ? 0.78 : 0.84;
+            var fontSafety = wideGlyphs ? 1.24 : 1.15;
+            var lineCount = estimateWrappedLines(
+                String(raw),
+                availableWidth * widthSafety,
+                fontSize * fontSafety
+            );
+            var lineHeight = fontSize * (wideGlyphs ? 1.42 : 1.34) + 1.5;
+            var requiredHeight = lineCount * lineHeight + 2.5;
+            var heightRatio = requiredHeight / Math.max(1, availableHeight);
+
+            if (heightRatio >= 1.02) {
+                addPdfIssue(
+                    issues,
+                    String(sheet.Name),
+                    address,
+                    "换行文字按严格模式估算需要约" + Math.ceil(requiredHeight) +
+                        "磅高度，当前可用约" + Math.round(availableHeight) +
+                        "磅，PDF可能出现半行或半个字",
+                    heightRatio >= 1.14 ? "高" : "中"
                 );
-            var requiredHeight =
-                lineCount *
-                    fontSize * 1.43 +
-                4;
-            var safeFactor =
-                atBottomPrintEdge
-                    ? 0.90
-                    : 0.96;
-            if (
-                requiredHeight * safeFactor >
-                height
+            } else if (
+                wideGlyphs &&
+                heightRatio >= 0.90 &&
+                (atBottomPrintEdge || String(raw).length >= 10)
             ) {
                 addPdfIssue(
                     issues,
                     String(sheet.Name),
                     address,
-                    "自动换行文字所需高度约" +
-                        Math.ceil(requiredHeight) +
-                        "磅，当前仅" +
-                        Math.round(height) +
-                        "磅，可能出现半行或半个字",
-                    "高"
+                    "中文换行文字的行高余量不足10%，PDF渲染时可能出现下沿截字",
+                    "中"
                 );
             }
             return;
         }
 
-        var requiredWidth =
-            getTextVisualUnits(
-                String(raw)
-            ) *
-            fontSize *
-            1.10;
-
-        if (
-            alignment === -4108 ||
-            alignment === -4130
-        ) {
-            requiredWidth *= 1.05;
+        /* 单行文字也检查垂直余量，旧版只检查横向宽度。 */
+        var singleLineNeed = fontSize * (wideGlyphs ? 1.20 : 1.14) + 1.0;
+        var verticalRatio = singleLineNeed / Math.max(1, availableHeight);
+        if (verticalRatio >= 1.06) {
+            addPdfIssue(
+                issues,
+                String(sheet.Name),
+                address,
+                "单行文字的行高余量不足，PDF可能切掉字形上沿或下沿",
+                verticalRatio >= 1.16 ? "高" : "中"
+            );
         }
 
+        else if (
+            wideGlyphs &&
+            availableHeight - singleLineNeed < fontSize * 0.22
+        ) {
+            addPdfIssue(
+                issues,
+                String(sheet.Name),
+                address,
+                "中文单行文字上下安全余量很小，PDF渲染时可能只切掉半个字的上沿/下沿",
+                "中"
+            );
+        }
+
+        var bold = false;
+        try { bold = !!cell.Font.Bold; } catch (ignoredBold) {}
+        var widthFactor = wideGlyphs ? 1.30 : 1.18;
+        if (bold) widthFactor *= 1.06;
+        var requiredWidth = getTextVisualUnits(String(raw)) * fontSize * widthFactor + 2.5;
+        if (alignment === -4108 || alignment === -4130) requiredWidth *= 1.04;
+
         if (shrink) {
-            var shrinkRatio =
-                availableWidth /
-                Math.max(1, requiredWidth);
-            if (shrinkRatio < 0.72) {
+            var shrinkRatio = availableWidth / Math.max(1, requiredWidth);
+            if (shrinkRatio < 0.82) {
                 addPdfIssue(
                     issues,
                     String(sheet.Name),
                     address,
-                    "已启用缩小字体，但估算需缩至" +
+                    "已启用缩小字体，但严格估算需缩至" +
                         Math.round(shrinkRatio * 100) +
-                        "%才能放下，PDF中可能过小或显示异常",
-                    "中"
+                        "%左右才能放下，PDF中可能过小或出现字形异常",
+                    shrinkRatio < 0.65 ? "高" : "中"
                 );
             }
             return;
@@ -8787,79 +10119,69 @@ function 工程表清理_内部执行(action, scopeMode) {
 
         var blocked = false;
         try {
-            if (
-                descriptor &&
-                descriptor.columnCount > 1
-            ) {
-                blocked = true;
-            }
+            if (descriptor && descriptor.columnCount > 1) blocked = true;
         } catch (ignored7) {}
         try {
-            if (
-                getVisibleBorder(
-                    cell,
-                    10
-                )
-            ) {
-                blocked = true;
-            }
+            if (getVisibleBorder(cell, 10)) blocked = true;
         } catch (ignored8) {}
         try {
-            var nextCell =
-                sheet.Cells.Item(
-                    Number(cell.Row),
-                    (
-                        descriptor
-                            ? descriptor.lastColumn
-                            : Number(cell.Column)
-                    ) + 1
-                );
-            if (
-                !isBlankValue(
-                    readMergedAwareValue(
-                        nextCell
-                    )
-                )
-            ) {
-                blocked = true;
-            }
+            var nextCell = sheet.Cells.Item(
+                Number(cell.Row),
+                (descriptor ? descriptor.lastColumn : Number(cell.Column)) + 1
+            );
+            if (!isBlankValue(readMergedAwareValue(nextCell))) blocked = true;
         } catch (ignored9) {}
 
-        var ratio =
-            requiredWidth /
-            Math.max(1, availableWidth);
+        var ratio = requiredWidth / Math.max(1, availableWidth);
+        var remainingWidth = availableWidth - requiredWidth;
+        var oneGlyphSafety = fontSize * (wideGlyphs ? 1.05 : 0.66);
+        var nearHalfGlyph = remainingWidth < oneGlyphSafety * 0.72;
+        var nearOneGlyph = remainingWidth < oneGlyphSafety * 1.05;
 
-        if (
-            blocked &&
-            ratio >= 1.0
-        ) {
+        /*
+         * v1.8.2：不只看“占宽比例”，还直接看末尾还剩多少磅。
+         * 半个汉字通常发生在只剩不到一个字形宽度的临界区域；
+         * 这种情况在短文本/宽合并单元格里用比例判断很容易漏掉。
+         */
+        if (blocked && ratio >= 0.95) {
             addPdfIssue(
                 issues,
                 String(sheet.Name),
                 address,
-                "未换行且未缩小字体，估算文字宽度超过可用宽度，PDF可能横向截断",
-                "高"
+                "严格估算文字宽度已达到或超过单元格安全宽度，PDF存在截字风险",
+                ratio >= 1.08 ? "高" : "中"
             );
-        } else if (
-            blocked &&
-            ratio >= 0.86
-        ) {
+        } else if (blocked && wideGlyphs && nearHalfGlyph) {
             addPdfIssue(
                 issues,
                 String(sheet.Name),
                 address,
-                "文字已接近单元格右边界，字体替换或PDF渲染差异可能造成半个字",
+                "末尾横向安全余量仅约" + Math.max(0, Math.round(remainingWidth * 10) / 10) +
+                    "磅，不足约1个汉字宽；PDF字体替换/像素取整时容易出现半个字",
+                remainingWidth < 0 ? "高" : "中"
+            );
+        } else if (blocked && wideGlyphs && (ratio >= 0.76 || nearOneGlyph)) {
+            addPdfIssue(
+                issues,
+                String(sheet.Name),
+                address,
+                "中文文字距离右侧边界不足约1个汉字的安全余量，PDF可能截掉末尾字形",
                 "中"
             );
-        } else if (
-            atRightPrintEdge &&
-            ratio >= 0.80
-        ) {
+        } else if (atRightPrintEdge && wideGlyphs && (ratio >= 0.68 || nearOneGlyph)) {
             addPdfIssue(
                 issues,
                 String(sheet.Name),
                 address,
-                "文字位于打印区域最右列且接近边界，导出PDF可能切掉末尾半个字",
+                "中文文字位于打印区域最右列，末尾余量不足约1个汉字宽，PDF可能切掉半个字",
+                "中"
+            );
+        } else if (atRightPrintEdge && ratio >= 0.72) {
+            addPdfIssue(
+                issues,
+                String(sheet.Name),
+                address,
+                "文字位于打印区域最右列且安全余量较小，导出PDF可能切掉末尾字形",
                 "中"
             );
         }
@@ -8881,24 +10203,39 @@ function 工程表清理_内部执行(action, scopeMode) {
             };
         }
 
-        var printArea = null;
-        try {
-            printArea =
-                parseSinglePrintArea(
-                    sheet.PageSetup
-                        .PrintArea
-                );
-        } catch (ignored0) {}
+        var printAreaState = getPrintAreaState(sheet);
+        var printArea = printAreaState.bounds;
 
+        /*
+         * v1.8.3：不再把“PageSetup.PrintArea 读到空字符串”直接解释为“未设置”。
+         * 用户已实测 WPS 某些工作簿明明存在蓝色打印区域，JSA 批量读取仍会暂时返回空。
+         * 先尝试 PageSetup，再回退到 Sheet/Workbook 的 Print_Area 名称；若仍读不到，
+         * 只按实际内容做文字检查，不生成“未设置打印区域”的误报。
+         */
         if (!printArea) {
+            try {
+                var usedForPdf = getUsedBounds(sheet);
+                var extraRows = Math.max(0, usedForPdf.lastRow - actual.lastRow);
+                var extraColumns = Math.max(0, usedForPdf.lastColumn - actual.lastColumn);
+                if (extraRows >= 80 || extraColumns >= 10) {
+                    addPdfIssue(
+                        issues,
+                        String(sheet.Name),
+                        columnToLetters(actual.firstColumn) + actual.firstRow + ":" +
+                            columnToLetters(actual.lastColumn) + actual.lastRow,
+                        "WPS接口暂时无法可靠读取打印区域，同时UsedRange远大于实际内容；请仅在打印预览中核对尾部/右侧是否被带入",
+                        "提示"
+                    );
+                }
+            } catch (ignoredPrintArea) {}
+        } else if (printArea.lastRow > actual.lastRow) {
             addPdfIssue(
                 issues,
                 String(sheet.Name),
-                columnToLetters(
-                    actual.firstColumn
-                ) +
-                actual.firstRow,
-                "未设置打印区域，导出结果可能受UsedRange残留格式影响",
+                columnToLetters(printArea.firstColumn) + (actual.lastRow + 1) + ":" +
+                    columnToLetters(printArea.lastColumn) + printArea.lastRow,
+                "PrintArea底边在实际内容最后一行（第" + actual.lastRow +
+                    "行）之后，蓝色打印底边可能未自动贴合；多出的空白/残留格式可能被带入打印",
                 "中"
             );
         } else if (
@@ -8927,6 +10264,63 @@ function 工程表清理_内部执行(action, scopeMode) {
                 "明确"
             );
         }
+
+        /*
+         * v1.8.8：增加“应分页但实际没有分页线”的结构检测。
+         * 例如同一张工作表中出现第二个“单位工程概预算表”宽合并标题，
+         * 按插件规则该标题应从新页开始；若实际分页线缺失，之前的体检会错误地报告0项。
+         */
+        try {
+            var layoutBounds = getVisibleTableBounds(sheet, actual);
+            var layoutBlocks = detectBorderTableBlocks(sheet, layoutBounds);
+            if (layoutBlocks.length) {
+                layoutBounds.firstRow = Math.min(layoutBounds.firstRow, layoutBlocks[0].firstRow);
+                layoutBounds.lastRow = Math.max(actual.lastRow, layoutBlocks[layoutBlocks.length - 1].lastRow);
+                for (var lb = 0; lb < layoutBlocks.length; lb += 1) {
+                    layoutBounds.firstColumn = Math.min(layoutBounds.firstColumn, layoutBlocks[lb].firstColumn);
+                    layoutBounds.lastColumn = Math.max(layoutBounds.lastColumn, layoutBlocks[lb].lastColumn);
+                }
+            }
+            var expectedPageBreakRows = detectDesiredPageBreakRows(sheet, layoutBounds);
+            var missingPageBreakRows = getMissingDesiredPageBreakRows(sheet, expectedPageBreakRows);
+            for (var mb = 0; mb < missingPageBreakRows.length; mb += 1) {
+                var missingRow = missingPageBreakRows[mb];
+                addPdfIssue(
+                    issues,
+                    String(sheet.Name),
+                    columnToLetters(layoutBounds.firstColumn) + missingRow + ":" +
+                        columnToLetters(layoutBounds.lastColumn) + missingRow,
+                    "检测到后续独立表格/宽合并表名从第" + missingRow +
+                        "行开始，但该行前没有实际水平分页线；整本打印时可能把两张逻辑表接在同一页",
+                    "明确"
+                );
+            }
+
+
+            /*
+             * v1.8.8：检测“打印区域没错，但最后一页只剩合计/1~2个有效行”的情况。
+             * 这种问题在分页预览里表现为：打印底边正确，但自动分页线紧贴底部，
+             * 导致“合计”被单独推到最后一页。旧体检只看 PrintArea，因此会漏报。
+             */
+            var shortTail = detectShortFinalPage(
+                sheet,
+                layoutBounds,
+                expectedPageBreakRows
+            );
+            if (shortTail) {
+                var tailRowsText = shortTail.meaningfulRows.join("、");
+                addPdfIssue(
+                    issues,
+                    String(sheet.Name),
+                    "行" + tailRowsText,
+                    "最后一个实际分页从第" + shortTail.breakRow +
+                        "行开始，打印底部仅剩" + shortTail.meaningfulCount +
+                        "个有效行" + (shortTail.summaryOnly ? "（合计/汇总行）" : "") +
+                        "；PrintArea本身可能正确，但尾页会形成孤行/单独一页",
+                    shortTail.summaryOnly ? "明确" : "中"
+                );
+            }
+        } catch (ignoredLayoutAudit) {}
 
         var scanBounds =
             printArea || actual;
@@ -9092,6 +10486,128 @@ function 工程表清理_内部执行(action, scopeMode) {
         };
     }
 
+    function deleteReportSheetByName(workbook, sheetName) {
+        var existing = findWorksheet(workbook, sheetName);
+        if (!existing) return false;
+        try {
+            if (String(Application.ActiveSheet.Name) === String(sheetName)) {
+                for (var i = 1; i <= workbook.Worksheets.Count; i += 1) {
+                    var candidate = workbook.Worksheets.Item(i);
+                    if (String(candidate.Name) !== String(sheetName)) {
+                        candidate.Activate();
+                        break;
+                    }
+                }
+            }
+        } catch (ignored0) {}
+        var oldAlerts = Application.DisplayAlerts;
+        try { Application.DisplayAlerts = false; } catch (ignored1) {}
+        try {
+            existing.Delete();
+            return true;
+        } catch (ignored2) {
+            return false;
+        } finally {
+            try { Application.DisplayAlerts = oldAlerts; } catch (ignored3) {}
+        }
+    }
+
+    function classifyPdfIssue(reason) {
+        var text = String(reason || "");
+        if (text.indexOf("PrintArea") >= 0 || text.indexOf("打印区域") >= 0 || text.indexOf("UsedRange") >= 0 || text.indexOf("打印预览") >= 0) return "打印范围";
+        if (text.indexOf("分页") >= 0 || text.indexOf("合并单元格") >= 0) return "分页/合并";
+        if (text.indexOf("行高") >= 0 || text.indexOf("下沿") >= 0 || text.indexOf("上沿") >= 0) return "行高/字形";
+        if (text.indexOf("半个字") >= 0 || text.indexOf("截字") >= 0 || text.indexOf("字形") >= 0) return "文字截断";
+        if (text.indexOf("###") >= 0 || text.indexOf("列宽") >= 0) return "显示宽度";
+        return "PDF文字";
+    }
+
+    function pdfIssueSuggestion(item) {
+        var reason = String(item.reason || "");
+        if (reason.indexOf("PrintArea") >= 0 || reason.indexOf("打印区域") >= 0 || reason.indexOf("UsedRange") >= 0 || reason.indexOf("打印预览") >= 0) {
+            return "检查打印区域；如尾部/右侧存在残留格式，可清理后重新设置打印范围。";
+        }
+        if (reason.indexOf("分页") >= 0 || reason.indexOf("合并单元格") >= 0) {
+            return "进入分页预览，避免分页线穿过该合并区域。";
+        }
+        if (reason.indexOf("行高") >= 0 || reason.indexOf("下沿") >= 0 || reason.indexOf("上沿") >= 0) {
+            return "适当增加行高，导出PDF后重点检查该单元格文字上下边缘。";
+        }
+        return "适当增加列宽/合并区域宽度或调整字号，再导出PDF复查末尾字符。";
+    }
+
+    function createPdfRiskReportSheet(workbook, scopeLabel, issues, scannedCells, failures) {
+        deleteReportSheetByName(workbook, PDF_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = PDF_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 10).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(10).Hidden = true; } catch (ignored0) {}
+
+        var high = 0, medium = 0, hint = 0;
+        for (var c = 0; c < issues.length; c += 1) {
+            var sev = String(issues[c].severity || "");
+            if (sev === "明确" || sev === "高") high += 1;
+            else if (sev === "中") medium += 1;
+            else hint += 1;
+        }
+
+        report.Range("A1:G1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜PDF文字/打印风险报告";
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A1").HorizontalAlignment = -4108;
+
+        report.Range("A2:G2").Merge();
+        report.Range("A2").Value2 =
+            "范围：" + scopeLabel + "；扫描约" + scannedCells + "个单元格；发现" + issues.length +
+            "项（高/明确" + high + "，中" + medium + "，提示" + hint + "）。";
+        report.Range("A2").WrapText = true;
+
+        report.Range("A3:G3").Merge();
+        report.Range("A3").Value2 =
+            "此报告用于定位可疑位置，不会自动修改原表。处理后建议重新检测，并以实际PDF结果为最终依据。" +
+            (failures.length ? " 另有" + failures.length + "张表检查失败。" : "");
+        report.Range("A3").WrapText = true;
+
+        var headers = ["序号", "风险等级", "工作表", "位置", "类型", "发现问题", "建议处理"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(5, h + 1).Value2 = headers[h];
+        report.Range("A5:G5").Font.Bold = true;
+        report.Range("A5:G5").HorizontalAlignment = -4108;
+
+        for (var i = 0; i < issues.length; i += 1) {
+            var row = 6 + i;
+            var item = issues[i];
+            report.Cells.Item(row, 1).Value2 = i + 1;
+            report.Cells.Item(row, 2).Value2 = item.severity;
+            report.Cells.Item(row, 3).Value2 = item.sheetName;
+            report.Cells.Item(row, 4).Value2 = item.address;
+            report.Cells.Item(row, 5).Value2 = classifyPdfIssue(item.reason);
+            report.Cells.Item(row, 6).Value2 = item.reason;
+            report.Cells.Item(row, 7).Value2 = pdfIssueSuggestion(item);
+        }
+
+        var lastRow = Math.max(6, 5 + issues.length);
+        report.Range("A5:G" + lastRow).Borders.LineStyle = 1;
+        report.Range("A5:G" + lastRow).VerticalAlignment = -4160;
+        report.Range("D6:G" + lastRow).WrapText = true;
+        try { report.Range("A5:G" + lastRow).AutoFilter(); } catch (ignored1) {}
+        report.Columns.Item(1).ColumnWidth = 8;
+        report.Columns.Item(2).ColumnWidth = 11;
+        report.Columns.Item(3).ColumnWidth = 30;
+        report.Columns.Item(4).ColumnWidth = 20;
+        report.Columns.Item(5).ColumnWidth = 16;
+        report.Columns.Item(6).ColumnWidth = 62;
+        report.Columns.Item(7).ColumnWidth = 48;
+        report.Rows.Item(1).RowHeight = 28;
+        report.Rows.Item(2).RowHeight = 28;
+        report.Rows.Item(3).RowHeight = 34;
+
+        report.Activate();
+        report.Range("A6").Select();
+        try { Application.ActiveWindow.FreezePanes = true; } catch (ignored2) {}
+        return report;
+    }
+
     function detectPdfRisksByScope(
         mode
     ) {
@@ -9173,7 +10689,7 @@ function 工程表清理_内部执行(action, scopeMode) {
         );
 
         if (!issues.length) {
-            MsgBox(
+            工程表清理_安全MsgBox(
                 "已检查" +
                 sheetNames.length +
                 "张工作表、约" +
@@ -9196,97 +10712,1175 @@ function 工程表清理_内部执行(action, scopeMode) {
             return;
         }
 
-        var displayCount =
-            Math.min(
-                issues.length,
-                24
-            );
-        var lines = [];
-
-        for (
-            var k = 0;
-            k < displayCount;
-            k += 1
-        ) {
-            lines.push(
-                (k + 1) +
-                ". [" +
-                issues[k].severity +
-                "] “" +
-                issues[k].sheetName +
-                "”!" +
-                issues[k].address +
-                "\n   " +
-                issues[k].reason
-            );
+        var highCount = 0;
+        var mediumCount = 0;
+        var hintCount = 0;
+        for (var k = 0; k < issues.length; k += 1) {
+            var severity = String(issues[k].severity || "");
+            if (severity === "明确" || severity === "高") highCount += 1;
+            else if (severity === "中") mediumCount += 1;
+            else hintCount += 1;
         }
 
-        if (
-            issues.length >
-            displayCount
-        ) {
-            lines.push(
-                "……另有" +
-                (
-                    issues.length -
-                    displayCount
-                ) +
-                "项未展开。"
-            );
-        }
-
-        MsgBox(
-            "已检查" +
-            sheetNames.length +
-            "张工作表、约" +
-            scannedCells +
-            "个单元格。" +
-            "\n发现" +
-            issues.length +
-            "项PDF导出风险：\n\n" +
-            lines.join("\n") +
-            (
-                failures.length
-                    ? "\n\n另有" +
-                      failures.length +
-                      "张工作表检查失败。"
-                    : ""
-            ) +
-            "\n\n关闭窗口后将定位第一项风险。",
-            JS_EXCLAMATION,
-            "PDF导出风险检测"
+        var scopeLabel = mode === "workbook" ? "整个工作簿" : "当前工作表";
+        createPdfRiskReportSheet(
+            workbook,
+            scopeLabel,
+            issues,
+            scannedCells,
+            failures
         );
 
-        try {
-            var first =
-                issues[0];
-            var firstSheet =
-                findWorksheet(
-                    workbook,
-                    first.sheetName
-                );
-            if (firstSheet) {
-                firstSheet.Activate();
-                firstSheet
-                    .Range(
-                        first.address
-                    )
-                    .Select();
-            }
-        } catch (ignored) {}
+        工程表清理_安全MsgBox(
+            "PDF风险检测完成。\n" +
+            "已检查" + sheetNames.length + "张工作表、约" + scannedCells + "个单元格。\n" +
+            "发现" + issues.length + "项：高/明确" + highCount +
+            "，中" + mediumCount + "，提示" + hintCount + "。\n\n" +
+            "详细位置已写入“" + PDF_REPORT_SHEET_NAME + "”。\n" +
+            "可在报告中筛选工作表、位置和风险类型。\n" +
+            "报告表可用【删除插件报告表】一键删除。" +
+            (failures.length ? "\n另有" + failures.length + "张表检查失败。" : ""),
+            JS_EXCLAMATION,
+            "PDF风险检测完成"
+        );
     }
 
 
+    function summarizeRowsCompact(rows) {
+        if (!rows || !rows.length) return "";
+        var sorted = rows.slice().sort(function (a, b) { return a - b; });
+        var parts = [];
+        var start = sorted[0];
+        var end = sorted[0];
+        for (var i = 1; i < sorted.length; i += 1) {
+            if (sorted[i] === end + 1) {
+                end = sorted[i];
+                continue;
+            }
+            parts.push(start === end ? String(start) : start + "-" + end);
+            start = sorted[i];
+            end = sorted[i];
+        }
+        parts.push(start === end ? String(start) : start + "-" + end);
+        if (parts.length > 8) {
+            return parts.slice(0, 8).join(",") + "…";
+        }
+        return parts.join(",");
+    }
+
+    function auditConfidenceFromSeverity(severity) {
+        var value = String(severity || "");
+        if (value === "明确" || value === "高") return "高";
+        if (value === "中") return "中";
+        return "低";
+    }
+
+    function addAuditIssue(issues, item) {
+        if (issues.length >= MAX_AUDIT_ISSUES) return;
+        var severity = item.severity || "中";
+        issues.push({
+            severity: severity,
+            confidence: item.confidence || auditConfidenceFromSeverity(severity),
+            sheetName: item.sheetName || "",
+            category: item.category || "其他",
+            address: item.address || "",
+            currentState: item.currentState || item.problem || "",
+            expectedState: item.expectedState || "符合当前检查规则",
+            basis: item.basis || "插件规则检查",
+            problem: item.problem || "",
+            suggestion: item.suggestion || "",
+            action: item.action || ""
+        });
+    }
+
+    function inspectNumberingIssuesOnSheet(sheet) {
+        var result = { chinese: [], numeric: [] };
+        var bounds = getUsedBounds(sheet);
+        var contentRows = getActualContentRowBounds(sheet, bounds);
+        if (!contentRows) return result;
+        var headers = findSerialHeaders(sheet, bounds);
+        if (!headers.length) return result;
+        var header = chooseHeaderAutomatically(headers, "序号", bounds);
+        if (!header) return result;
+        var serialColumn = Number(getWritableMergedTopLeft(
+            sheet.Cells.Item(header.row, header.column)
+        ).Column);
+
+        var majorItems = [];
+        for (var row = Number(header.row) + 1; row <= contentRows.lastRow; row += 1) {
+            var source = sheet.Cells.Item(row, serialColumn);
+            if (cellHasFormula(getWritableMergedTopLeft(source))) continue;
+            var serialText = normalizeText(readMergedAwareValue(source));
+            var major = parseMajorNumber(serialText);
+            if (major) {
+                var nameText = firstTextToRight(sheet, row, serialColumn, bounds);
+                if (nameText) {
+                    majorItems.push({
+                        row: row,
+                        value: serialText,
+                        suffix: major.suffix,
+                        key: normalizeText(nameText).replace(/\s+/g, "").toLowerCase()
+                    });
+                }
+            }
+        }
+        var numberByName = {};
+        var nextMajor = 1;
+        for (var m = 0; m < majorItems.length; m += 1) {
+            var majorItem = majorItems[m];
+            if (!numberByName[majorItem.key]) {
+                numberByName[majorItem.key] = nextMajor;
+                nextMajor += 1;
+            }
+            var expectedMajor = chineseNumber(numberByName[majorItem.key]) + majorItem.suffix;
+            if (majorItem.value !== expectedMajor) {
+                result.chinese.push({ row: majorItem.row, from: majorItem.value, to: expectedMajor });
+            }
+        }
+
+        /* v1.9.0：体检与真正的“智能数字序号顺位”共用同一层级推断。 */
+        var seenOriginal = {};
+        var items = [];
+        var previousItem = null;
+        for (var r = Number(header.row) + 1; r <= contentRows.lastRow; r += 1) {
+            var cell = sheet.Cells.Item(r, serialColumn);
+            if (cellHasFormula(getWritableMergedTopLeft(cell))) continue;
+            var parsed = parseNumericSerial(readMergedAwareValue(cell));
+            if (!parsed) continue;
+            if (Number(parsed.depth) === 1) seenOriginal = {};
+            var profile = getNumericRowProfile(sheet, r, serialColumn, bounds);
+            var inference = inferNumericSerialLevel(parsed, profile, previousItem, seenOriginal);
+            var item = {
+                row: r,
+                column: serialColumn,
+                original: parsed.text,
+                parsed: parsed,
+                profile: profile,
+                level: inference.level,
+                smart: inference.smart,
+                reason: inference.reason,
+                expected: ""
+            };
+            items.push(item);
+            previousItem = item;
+            seenOriginal[parsed.parts.join(".")] = true;
+        }
+        buildSmartNumericSerial(items);
+        for (var n = 0; n < items.length; n += 1) {
+            if (items[n].original !== items[n].expected) {
+                result.numeric.push({
+                    row: items[n].row,
+                    from: items[n].original,
+                    to: items[n].expected,
+                    level: items[n].level,
+                    smart: items[n].smart,
+                    reason: items[n].reason
+                });
+            }
+        }
+        return result;
+    }
+
+
+    function boundsToText(bounds) {
+        if (!bounds) return "（无）";
+        return absoluteRangeAddress(bounds);
+    }
+
+    function readPageSetupValue(sheet, name) {
+        try {
+            var value = sheet.PageSetup[name];
+            if (value === null || value === undefined || value === "") return "（空）";
+            return String(value);
+        } catch (ignored) {
+            return "（接口不可读）";
+        }
+    }
+
+    function pageBreakTypeText(value) {
+        var type = Number(value);
+        if (type === -4105) return "自动分页";
+        if (type === -4135) return "手动分页";
+        if (type === -4142) return "无分页";
+        return "未知(" + String(value) + ")";
+    }
+
+    function getHPageBreakCollectionRows(sheet) {
+        var result = [];
+        try {
+            var breaks = sheet.HPageBreaks;
+            for (var i = 1; i <= Number(breaks.Count); i += 1) {
+                try {
+                    var row = Number(breaks.Item(i).Location.Row);
+                    if (isFinite(row) && row >= 2) result.push(row);
+                } catch (ignored0) {}
+            }
+        } catch (ignored1) {}
+        result.sort(function (a, b) { return a - b; });
+        return result;
+    }
+
+    function getVPageBreakCollectionColumns(sheet) {
+        var result = [];
+        try {
+            var breaks = sheet.VPageBreaks;
+            for (var i = 1; i <= Number(breaks.Count); i += 1) {
+                try {
+                    var column = Number(breaks.Item(i).Location.Column);
+                    if (isFinite(column) && column >= 2) result.push(column);
+                } catch (ignored0) {}
+            }
+        } catch (ignored1) {}
+        result.sort(function (a, b) { return a - b; });
+        return result;
+    }
+
+    function summarizeTableBlocks(blocks) {
+        if (!blocks || !blocks.length) return "未识别到连续边框表格块";
+        var parts = [];
+        for (var i = 0; i < blocks.length && i < 20; i += 1) {
+            parts.push("块" + (i + 1) + "=" + boundsToText(blocks[i]));
+        }
+        if (blocks.length > 20) parts.push("…共" + blocks.length + "块");
+        return parts.join("；");
+    }
+
+    function createPageDiagnosticReportCurrent() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var sheet = context.sheet;
+        if (!sheet || isPluginReportSheet(sheet)) throw new Error("请先切换到要诊断的原始工程工作表。 ");
+        var originalSheetName = String(sheet.Name);
+
+        /* 诊断只读取，不调用重建函数，不修改原表。 */
+        forceRefreshWorksheetForPrint(sheet);
+        var actual = getActualContentBounds(sheet);
+        var used = getUsedBounds(sheet);
+        var printState = getPrintAreaState(sheet);
+        var bounds = printState.bounds || actual || used;
+        if (!bounds) throw new Error("当前工作表没有可诊断的有效范围。 ");
+        var visible = actual ? getVisibleTableBounds(sheet, actual) : null;
+        var blocks = detectBorderTableBlocks(sheet, bounds);
+        var diagnosticWideTitleRows = [];
+        for (var diagnosticRow = bounds.firstRow; diagnosticRow <= bounds.lastRow; diagnosticRow += 1) {
+            if (rowIsWideTableTitle(sheet, diagnosticRow, bounds)) diagnosticWideTitleRows.push(diagnosticRow);
+        }
+        var diagnosticTitleStarts = collapseWideTitleRowsToSectionStarts(diagnosticWideTitleRows);
+        var desired = detectDesiredPageBreakRows(sheet, bounds);
+        var rowBreaks = getActualHorizontalPageBreakRows(sheet, bounds);
+        var hRows = getHPageBreakCollectionRows(sheet);
+        var vColumns = getVPageBreakCollectionColumns(sheet);
+        var shortTail = null;
+        try { shortTail = detectShortFinalPage(sheet, bounds, desired); } catch (ignored0) {}
+
+        var rowMap = {};
+        function markRows(list, key) {
+            for (var i = 0; i < list.length; i += 1) {
+                var row = Number(list[i]);
+                if (!rowMap[row]) rowMap[row] = { row: row };
+                rowMap[row][key] = true;
+            }
+        }
+        markRows(rowBreaks, "rowBreak");
+        markRows(hRows, "hCollection");
+        markRows(desired, "desired");
+        var rows = [];
+        for (var key in rowMap) if (rowMap.hasOwnProperty(key)) rows.push(rowMap[key]);
+        rows.sort(function (a, b) { return a.row - b.row; });
+
+        deleteReportSheetByName(workbook, PAGE_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = PAGE_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 10).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(10).Hidden = true; } catch (ignored1) {}
+
+        report.Range("A1:H1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜分页诊断｜" + originalSheetName;
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A1").HorizontalAlignment = -4108;
+        report.Range("A2:H2").Merge();
+        report.Range("A2").Value2 = "只读取 WPS 当前分页状态，不修改原表。此报告用于定位‘插件预测与 WPS 实际蓝线不一致’的原因。";
+        report.Range("A2").WrapText = true;
+
+        var meta = [
+            ["诊断工作表", originalSheetName, "当前活动原表"],
+            ["实际内容范围", boundsToText(actual), "只看非空值/公式"],
+            ["UsedRange", boundsToText(used), "WPS UsedRange，可能包含历史格式"],
+            ["可见表格范围", boundsToText(visible), "内容 + 可见边框外包范围"],
+            ["PrintArea原始值", printState.text || "（未可靠读取）", printState.source || "无可靠来源"],
+            ["PrintArea解析范围", boundsToText(printState.bounds), printState.directReadable ? "PageSetup可读取" : "PageSetup读取异常/回退名称"],
+            ["Zoom", readPageSetupValue(sheet, "Zoom"), "打印缩放"],
+            ["FitToPagesWide", readPageSetupValue(sheet, "FitToPagesWide"), "横向适配页数"],
+            ["FitToPagesTall", readPageSetupValue(sheet, "FitToPagesTall"), "纵向适配页数"],
+            ["Orientation", readPageSetupValue(sheet, "Orientation"), "纸张方向枚举"],
+            ["PaperSize", readPageSetupValue(sheet, "PaperSize"), "纸张尺寸枚举"],
+            ["TopMargin", readPageSetupValue(sheet, "TopMargin"), "上边距（WPS内部单位）"],
+            ["BottomMargin", readPageSetupValue(sheet, "BottomMargin"), "下边距（WPS内部单位）"],
+            ["LeftMargin", readPageSetupValue(sheet, "LeftMargin"), "左边距（WPS内部单位）"],
+            ["RightMargin", readPageSetupValue(sheet, "RightMargin"), "右边距（WPS内部单位）"],
+            ["HPageBreaks集合", hRows.length ? hRows.join("、") : "（无）", "WPS HPageBreaks.Location.Row"],
+            ["Row.PageBreak读取", rowBreaks.length ? rowBreaks.join("、") : "（无）", "逐行读取自动/手动分页"],
+            ["VPageBreaks集合", vColumns.length ? vColumns.map(function (c) { return columnToLetters(c); }).join("、") : "（无）", "垂直分页位置"],
+            ["宽表名候选行", diagnosticWideTitleRows.length ? diagnosticWideTitleRows.join("、") : "（无）", "已排除工程名称/项目名称、合计/总计等非标题行"],
+            ["独立表头组起点", diagnosticTitleStarts.length ? diagnosticTitleStarts.join("、") : "（无）", "相邻宽标题候选折叠为同一表头组"],
+            ["插件期望手动分页行", desired.length ? desired.join("、") : "（无）", "只表示逻辑表之间应人工分隔的位置；WPS正常自动分页不要求与此列表一致"],
+            ["接口估算横向页数", String(Math.max(1, rowBreaks.length + 1)), "仅由实际水平分页位置估算，不等同打印驱动最终页数"],
+            ["插件期望手动分隔数", String(desired.length), "不用于预测WPS最终总页数"],
+            ["连续表格块", summarizeTableBlocks(blocks), "detectBorderTableBlocks"],
+            ["短尾页", shortTail ? ("是：最后分页从第" + shortTail.breakRow + "行开始，尾页有效行" + shortTail.meaningfulCount + "行") : "未检测到", "只诊断，不自动处理"]
+        ];
+
+        report.Range("A4:C4").Value2 = [["项目", "WPS/插件读取值", "说明"]];
+        report.Range("A4:C4").Font.Bold = true;
+        for (var m = 0; m < meta.length; m += 1) {
+            report.Cells.Item(5 + m, 1).Value2 = meta[m][0];
+            report.Cells.Item(5 + m, 2).Value2 = meta[m][1];
+            report.Cells.Item(5 + m, 3).Value2 = meta[m][2];
+        }
+        var detailStart = 6 + meta.length;
+        report.Range("A" + detailStart + ":H" + detailStart).Merge();
+        report.Range("A" + detailStart).Value2 = "实际分页线逐行对照";
+        report.Range("A" + detailStart).Font.Bold = true;
+        var headRow = detailStart + 1;
+        var headers = ["行号", "Row.PageBreak", "HPageBreaks集合", "插件期望手动分页", "该行有内容", "结论", "建议", "备注"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(headRow, h + 1).Value2 = headers[h];
+        report.Range("A" + headRow + ":H" + headRow).Font.Bold = true;
+
+        if (!rows.length) {
+            report.Cells.Item(headRow + 1, 1).Value2 = "—";
+            report.Cells.Item(headRow + 1, 6).Value2 = "未从接口读取到水平分页线";
+        } else {
+            for (var r = 0; r < rows.length; r += 1) {
+                var outRow = headRow + 1 + r;
+                var rec = rows[r];
+                var type = getRowPageBreakType(sheet, rec.row, bounds.firstColumn);
+                var conclusion = "一致";
+                if (rec.desired && !rec.rowBreak) {
+                    conclusion = "缺少插件期望的手动分页";
+                } else if (!rec.desired && rec.rowBreak) {
+                    if (Number(type) === -4135) {
+                        conclusion = "存在非期望手动分页";
+                    } else if (Number(type) === -4105) {
+                        conclusion = "WPS自动分页（正常）";
+                    } else {
+                        conclusion = "WPS存在额外分页";
+                    }
+                }
+                if (!!rec.rowBreak !== !!rec.hCollection) conclusion += "；Row与HPageBreaks不一致";
+                report.Cells.Item(outRow, 1).Value2 = rec.row;
+                report.Cells.Item(outRow, 2).Value2 = pageBreakTypeText(type);
+                report.Cells.Item(outRow, 3).Value2 = rec.hCollection ? "是" : "否";
+                report.Cells.Item(outRow, 4).Value2 = rec.desired ? "是" : "否";
+                report.Cells.Item(outRow, 5).Value2 = rowHasMeaningfulPrintContent(sheet, rec.row, bounds) ? "是" : "否";
+                report.Cells.Item(outRow, 6).Value2 = conclusion;
+                report.Cells.Item(outRow, 7).Value2 = (conclusion === "一致" || conclusion.indexOf("自动分页（正常）") >= 0) ? "无需处理" : "运行自动重建分页后再次诊断";
+                report.Cells.Item(outRow, 8).Value2 = rec.row === bounds.lastRow ? "打印范围末行" : "";
+            }
+        }
+
+        var lastRow = Math.max(headRow + 1, headRow + rows.length);
+        report.Range("A4:C" + (4 + meta.length)).Borders.LineStyle = 1;
+        report.Range("A" + headRow + ":H" + lastRow).Borders.LineStyle = 1;
+        report.Range("B5:C" + (4 + meta.length)).WrapText = true;
+        report.Range("F" + (headRow + 1) + ":H" + lastRow).WrapText = true;
+        var widths = [13, 34, 38, 14, 14, 48, 42, 24];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate();
+        report.Range("A4").Select();
+        工程表清理_安全MsgBox(
+            "分页诊断完成。\n工作表：" + originalSheetName +
+            "\nRow.PageBreak读取：" + rowBreaks.length + "处" +
+            "\nHPageBreaks集合：" + hRows.length + "处" +
+            "\n插件期望：" + desired.length + "处" +
+            "\n详细数据已写入“" + PAGE_DIAGNOSTIC_REPORT_SHEET_NAME + "”。",
+            JS_INFORMATION,
+            "分页诊断完成"
+        );
+        return report;
+    }
+
+    function createBorderDiagnosticReportCurrent() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var sheet = context.sheet;
+        if (!sheet || isPluginReportSheet(sheet)) throw new Error("请先切换到要诊断的原始工程工作表。 ");
+        var originalName = String(sheet.Name);
+        var actual = getActualContentBounds(sheet);
+        if (!actual) throw new Error("当前工作表没有可诊断的实际内容。 ");
+        var blocks = detectBorderTableBlocks(sheet, actual);
+
+        deleteReportSheetByName(workbook, BORDER_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = BORDER_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 10).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(10).Hidden = true; } catch (ignored0) {}
+        report.Range("A1:G1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜表格线宽诊断｜" + originalName;
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A2:G2").Merge();
+        report.Range("A2").Value2 = "只检查现有边框，不新增、不修改边框。按当前‘统一线宽（保守）’规则逐块核验。";
+        report.Range("A2").WrapText = true;
+        var headers = ["序号", "表格块范围", "边界引用检查数", "不一致数", "状态", "判断依据", "建议"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(4, h + 1).Value2 = headers[h];
+        report.Range("A4:G4").Font.Bold = true;
+        if (!blocks.length) {
+            report.Cells.Item(5, 1).Value2 = 1;
+            report.Cells.Item(5, 5).Value2 = "未识别到连续边框表格块";
+        } else {
+            for (var i = 0; i < blocks.length; i += 1) {
+                var check = verifyBorderBlocks(sheet, [blocks[i]], -4138, 2);
+                var row = 5 + i;
+                report.Cells.Item(row, 1).Value2 = i + 1;
+                report.Cells.Item(row, 2).Value2 = boundsToText(blocks[i]);
+                report.Cells.Item(row, 3).Value2 = check.checked;
+                report.Cells.Item(row, 4).Value2 = check.failed;
+                report.Cells.Item(row, 5).Value2 = check.failed ? "需核对" : "通过";
+                report.Cells.Item(row, 6).Value2 = "内部已有线按细线核验；外圈不主动加粗；原本整段已粗时允许保留较粗级别。";
+                report.Cells.Item(row, 7).Value2 = check.failed ? "运行统一线宽（保守）后再诊断。" : "无需处理。";
+            }
+        }
+        var lastRow = Math.max(5, 4 + blocks.length);
+        report.Range("A4:G" + lastRow).Borders.LineStyle = 1;
+        report.Range("F5:G" + lastRow).WrapText = true;
+        var widths = [8, 24, 18, 14, 14, 52, 38];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate();
+        report.Range("A4").Select();
+        工程表清理_安全MsgBox("线宽诊断完成。\n识别表格块：" + blocks.length + "个。\n详细结果已写入“" + BORDER_DIAGNOSTIC_REPORT_SHEET_NAME + "”。", JS_INFORMATION, "线宽诊断完成");
+        return report;
+    }
+
+    function numberingDiagnosticConfidence(item) {
+        if (!item.smart) return "高";
+        var reason = String(item.reason || "");
+        if (reason.indexOf("结构相似") >= 0) return "高";
+        if (reason.indexOf("存在原父级") >= 0) return "高";
+        if (reason.indexOf("更像父项") >= 0) return "中";
+        return "中";
+    }
+
+    function createNumberingDiagnosticReportCurrent() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var sheet = context.sheet;
+        if (!sheet || isPluginReportSheet(sheet)) throw new Error("请先切换到要诊断的原始工程工作表。 ");
+        var originalName = String(sheet.Name);
+        var bounds = getUsedBounds(sheet);
+        var contentRows = getActualContentRowBounds(sheet, bounds);
+        if (!contentRows) throw new Error("当前工作表没有可诊断的实际内容。 ");
+        var headersFound = findSerialHeaders(sheet, bounds);
+        if (!headersFound.length) throw new Error("未识别到‘序号/编号/编码’列。 ");
+        var header = chooseHeaderAutomatically(headersFound, "序号", bounds);
+        if (!header) throw new Error("未能确定序号列。 ");
+        var serialColumn = Number(getWritableMergedTopLeft(sheet.Cells.Item(header.row, header.column)).Column);
+
+        var seenOriginal = {};
+        var items = [];
+        var previousItem = null;
+        for (var row = Number(header.row) + 1; row <= contentRows.lastRow; row += 1) {
+            var source = sheet.Cells.Item(row, serialColumn);
+            if (cellHasFormula(getWritableMergedTopLeft(source))) continue;
+            var parsed = parseNumericSerial(readMergedAwareValue(source));
+            if (!parsed) continue;
+            if (Number(parsed.depth) === 1) seenOriginal = {};
+            var profile = getNumericRowProfile(sheet, row, serialColumn, bounds);
+            var inference = inferNumericSerialLevel(parsed, profile, previousItem, seenOriginal);
+            var item = { row: row, original: parsed.text, parsed: parsed, profile: profile, level: inference.level, smart: inference.smart, reason: inference.reason, expected: "" };
+            items.push(item);
+            previousItem = item;
+            seenOriginal[parsed.parts.join(".")] = true;
+        }
+        buildSmartNumericSerial(items);
+        var chinese = inspectNumberingIssuesOnSheet(sheet).chinese;
+
+        deleteReportSheetByName(workbook, NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 10).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(10).Hidden = true; } catch (ignored0) {}
+        report.Range("A1:H1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜序号层级诊断｜" + originalName;
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A2:H2").Merge();
+        report.Range("A2").Value2 = "与‘数字序号（智能层级）’使用同一推断逻辑，但本功能只展示判断，不修改原表。";
+        report.Range("A2").WrapText = true;
+        var headers = ["类型", "行号", "原序号", "建议序号", "推断层级", "置信度", "判断依据", "状态"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(4, h + 1).Value2 = headers[h];
+        report.Range("A4:H4").Font.Bold = true;
+        var out = 5;
+        for (var i = 0; i < items.length; i += 1) {
+            var current = items[i];
+            report.Cells.Item(out, 1).Value2 = "数字层级";
+            report.Cells.Item(out, 2).Value2 = current.row;
+            report.Cells.Item(out, 3).Value2 = current.original;
+            report.Cells.Item(out, 4).Value2 = current.expected;
+            report.Cells.Item(out, 5).Value2 = current.level;
+            report.Cells.Item(out, 6).Value2 = numberingDiagnosticConfidence(current);
+            report.Cells.Item(out, 7).Value2 = current.reason;
+            report.Cells.Item(out, 8).Value2 = current.original === current.expected ? "通过" : "建议调整";
+            out += 1;
+        }
+        for (var c = 0; c < chinese.length; c += 1) {
+            report.Cells.Item(out, 1).Value2 = "中文大项";
+            report.Cells.Item(out, 2).Value2 = chinese[c].row;
+            report.Cells.Item(out, 3).Value2 = chinese[c].from;
+            report.Cells.Item(out, 4).Value2 = chinese[c].to;
+            report.Cells.Item(out, 5).Value2 = "—";
+            report.Cells.Item(out, 6).Value2 = "高";
+            report.Cells.Item(out, 7).Value2 = "同名内容应使用相同中文序号，名称首次出现才取得下一个序号。";
+            report.Cells.Item(out, 8).Value2 = "建议调整";
+            out += 1;
+        }
+        if (out === 5) {
+            report.Cells.Item(5, 8).Value2 = "没有可诊断的数字/中文序号";
+            out = 6;
+        }
+        var lastRow = out - 1;
+        report.Range("A4:H" + lastRow).Borders.LineStyle = 1;
+        report.Range("G5:H" + lastRow).WrapText = true;
+        var widths = [14, 10, 16, 16, 12, 12, 58, 16];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate();
+        report.Range("A4").Select();
+        var changed = 0;
+        for (var n = 0; n < items.length; n += 1) if (items[n].original !== items[n].expected) changed += 1;
+        工程表清理_安全MsgBox("序号层级诊断完成。\n数字序号行：" + items.length + "行；建议调整：" + changed + "处；中文大项异常：" + chinese.length + "处。\n详细结果已写入“" + NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME + "”。", JS_INFORMATION, "序号诊断完成");
+        return report;
+    }
+
+
+    function describeHorizontalPageBreakRows(sheet, rows, bounds) {
+        if (!rows || !rows.length) return "（无）";
+        var parts = [];
+        for (var i = 0; i < rows.length; i += 1) {
+            var row = Number(rows[i]);
+            var type = getRowPageBreakType(sheet, row, bounds.firstColumn);
+            var label = pageBreakTypeText(type);
+            parts.push(String(row) + "(" + label.replace("分页", "") + ")");
+        }
+        return parts.join("、");
+    }
+
+    function createPageDiagnosticWorkbookReport() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, "workbook");
+        var records = [];
+        var failures = [];
+        var issueCount = 0;
+
+        for (var i = 0; i < sheetNames.length; i += 1) {
+            updateProgress("分页诊断", i + 1, sheetNames.length);
+            try {
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
+                forceRefreshWorksheetForPrint(sheet);
+                var actual = getActualContentBounds(sheet);
+                var used = getUsedBounds(sheet);
+                var printState = getPrintAreaState(sheet);
+                var bounds = printState.bounds || actual || used;
+                if (!bounds) {
+                    records.push({
+                        sheetName: String(sheet.Name), actual: "（无）", printArea: "（无）",
+                        rowBreaks: "（无）", hBreaks: "（无）", wideTitles: "（无）",
+                        titleStarts: "（无）", desired: "（无）", status: "无可诊断内容", suggestion: "无需处理"
+                    });
+                    continue;
+                }
+
+                var wideRows = [];
+                for (var row = bounds.firstRow; row <= bounds.lastRow; row += 1) {
+                    if (rowIsWideTableTitle(sheet, row, bounds)) wideRows.push(row);
+                }
+                var titleStarts = collapseWideTitleRowsToSectionStarts(wideRows);
+                var desired = detectDesiredPageBreakRows(sheet, bounds);
+                var actualRows = getActualHorizontalPageBreakRows(sheet, bounds);
+                var hRows = getHPageBreakCollectionRows(sheet);
+                var actualMap = {};
+                for (var ar = 0; ar < actualRows.length; ar += 1) actualMap[Number(actualRows[ar])] = true;
+                var desiredMap = {};
+                for (var dr = 0; dr < desired.length; dr += 1) desiredMap[Number(desired[dr])] = true;
+
+                var unexpectedManual = [];
+                var missingDesired = [];
+                var rowVsCollection = [];
+                for (var a = 0; a < actualRows.length; a += 1) {
+                    var arow = Number(actualRows[a]);
+                    if (!desiredMap[arow] && Number(getRowPageBreakType(sheet, arow, bounds.firstColumn)) === -4135) unexpectedManual.push(arow);
+                }
+                for (var d = 0; d < desired.length; d += 1) {
+                    if (!actualMap[Number(desired[d])]) missingDesired.push(Number(desired[d]));
+                }
+                var hMap = {};
+                for (var hh = 0; hh < hRows.length; hh += 1) hMap[Number(hRows[hh])] = true;
+                for (var aa = 0; aa < actualRows.length; aa += 1) if (!hMap[Number(actualRows[aa])]) rowVsCollection.push(Number(actualRows[aa]));
+                for (var hb = 0; hb < hRows.length; hb += 1) if (!actualMap[Number(hRows[hb])]) rowVsCollection.push(Number(hRows[hb]));
+
+                var shortTail = null;
+                try { shortTail = detectShortFinalPage(sheet, bounds, desired); } catch (ignored0) {}
+
+                var problems = [];
+                var suggestions = [];
+                if (unexpectedManual.length) {
+                    problems.push("非期望手动分页：" + unexpectedManual.join("、"));
+                    suggestions.push("自动重建分页，清除误插手动蓝线");
+                }
+                if (missingDesired.length) {
+                    problems.push("缺少手动分页：" + missingDesired.join("、"));
+                    suggestions.push("自动重建分页，补齐逻辑表分隔");
+                }
+                if (rowVsCollection.length) {
+                    problems.push("Row.PageBreak与HPageBreaks不一致");
+                    suggestions.push("重建后再次诊断接口状态");
+                }
+                if (shortTail) {
+                    problems.push("短尾页：从" + shortTail.breakRow + "行起仅" + shortTail.meaningfulCount + "个有效行");
+                    suggestions.push("核对尾页平衡");
+                }
+                if (problems.length) issueCount += 1;
+
+                records.push({
+                    sheetName: String(sheet.Name),
+                    actual: boundsToText(actual),
+                    printArea: printState.text || boundsToText(printState.bounds) || "（未可靠读取）",
+                    rowBreaks: describeHorizontalPageBreakRows(sheet, actualRows, bounds),
+                    hBreaks: hRows.length ? hRows.join("、") : "（无）",
+                    wideTitles: wideRows.length ? wideRows.join("、") : "（无）",
+                    titleStarts: titleStarts.length ? titleStarts.join("、") : "（无）",
+                    desired: desired.length ? desired.join("、") : "（无）",
+                    status: problems.length ? problems.join("；") : "通过：未发现非期望手动分页/缺失逻辑分页",
+                    suggestion: suggestions.length ? suggestions.join("；") : "无需处理"
+                });
+            } catch (error) {
+                failures.push("“" + sheetNames[i] + "”：" + (error && error.message ? error.message : String(error)));
+                records.push({ sheetName: sheetNames[i], actual: "—", printArea: "—", rowBreaks: "—", hBreaks: "—", wideTitles: "—", titleStarts: "—", desired: "—", status: "诊断失败", suggestion: "查看失败原因" });
+            }
+        }
+
+        restoreActiveSheet(workbook, originalSheetName);
+        deleteReportSheetByName(workbook, PAGE_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = PAGE_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 13).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(13).Hidden = true; } catch (ignored1) {}
+        report.Range("A1:K1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜分页诊断｜整个工作簿";
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A2:K2").Merge();
+        report.Range("A2").Value2 = "逐表读取 WPS 实际蓝线，并把‘WPS自动分页’与‘插件期望的逻辑手动分页’分开判断；报告不修改原表。";
+        report.Range("A2").WrapText = true;
+        report.Range("A3:K3").Merge();
+        report.Range("A3").Value2 = "扫描" + sheetNames.length + "张工作表；发现" + issueCount + "张存在分页异常。" + (failures.length ? " 另有" + failures.length + "张表诊断失败。" : "");
+        var headers = ["序号", "工作表", "实际内容范围", "PrintArea", "实际Row.PageBreak", "HPageBreaks", "宽表名候选", "独立表头组", "期望手动分页", "诊断结论", "建议"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(5, h + 1).Value2 = headers[h];
+        report.Range("A5:K5").Font.Bold = true;
+        for (var r = 0; r < records.length; r += 1) {
+            var outRow = 6 + r;
+            var rec = records[r];
+            var vals = [r + 1, rec.sheetName, rec.actual, rec.printArea, rec.rowBreaks, rec.hBreaks, rec.wideTitles, rec.titleStarts, rec.desired, rec.status, rec.suggestion];
+            for (var c = 0; c < vals.length; c += 1) report.Cells.Item(outRow, c + 1).Value2 = vals[c];
+        }
+        var lastRow = Math.max(6, 5 + records.length);
+        report.Range("A5:K" + lastRow).Borders.LineStyle = 1;
+        report.Range("B6:K" + lastRow).WrapText = true;
+        try { report.Range("A5:K" + lastRow).AutoFilter(); } catch (ignored2) {}
+        var widths = [8, 28, 20, 28, 32, 20, 20, 20, 20, 54, 40];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate();
+        report.Range("A5").Select();
+        工程表清理_安全MsgBox("分页诊断完成。\n扫描" + sheetNames.length + "张工作表，发现" + issueCount + "张存在分页异常。\n详细结果已写入“" + PAGE_DIAGNOSTIC_REPORT_SHEET_NAME + "”。" + (failures.length ? "\n另有" + failures.length + "张表诊断失败。" : ""), issueCount || failures.length ? JS_EXCLAMATION : JS_INFORMATION, "分页诊断完成");
+        return report;
+    }
+
+    function createPageDiagnosticReportByScope(mode) {
+        if (mode === "workbook") return createPageDiagnosticWorkbookReport();
+        return createPageDiagnosticReportCurrent();
+    }
+
+    function createBorderDiagnosticWorkbookReport() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, "workbook");
+        var records = [];
+        var failures = [];
+        var failedBlocks = 0;
+        var totalBlocks = 0;
+
+        for (var i = 0; i < sheetNames.length; i += 1) {
+            updateProgress("线宽诊断", i + 1, sheetNames.length);
+            try {
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
+                var actual = getActualContentBounds(sheet);
+                if (!actual) {
+                    records.push({ sheetName: String(sheet.Name), block: "（无）", checked: 0, failed: 0, status: "无实际内容", suggestion: "无需处理" });
+                    continue;
+                }
+                var blocks = detectBorderTableBlocks(sheet, actual);
+                if (!blocks.length) {
+                    records.push({ sheetName: String(sheet.Name), block: "（未识别到连续边框表格块）", checked: 0, failed: 0, status: "无可诊断表格块", suggestion: "人工核对是否属于无框表" });
+                    continue;
+                }
+                for (var b = 0; b < blocks.length; b += 1) {
+                    var check = verifyBorderBlocks(sheet, [blocks[b]], -4138, 2);
+                    totalBlocks += 1;
+                    if (check.failed) failedBlocks += 1;
+                    records.push({
+                        sheetName: String(sheet.Name), block: boundsToText(blocks[b]), checked: check.checked, failed: check.failed,
+                        status: check.failed ? "需核对" : "通过",
+                        suggestion: check.failed ? "运行统一线宽（保守）后再诊断" : "无需处理"
+                    });
+                }
+            } catch (error) {
+                failures.push("“" + sheetNames[i] + "”：" + (error && error.message ? error.message : String(error)));
+                records.push({ sheetName: sheetNames[i], block: "—", checked: 0, failed: 0, status: "诊断失败", suggestion: "查看失败原因" });
+            }
+        }
+
+        restoreActiveSheet(workbook, originalSheetName);
+        deleteReportSheetByName(workbook, BORDER_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = BORDER_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 10).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(10).Hidden = true; } catch (ignored0) {}
+        report.Range("A1:H1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜表格线宽诊断｜整个工作簿";
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A2:H2").Merge();
+        report.Range("A2").Value2 = "逐张工作表、逐个连续边框表格块核验；只检查，不新增、不修改边框。";
+        report.Range("A3:H3").Merge();
+        report.Range("A3").Value2 = "扫描" + sheetNames.length + "张工作表；识别" + totalBlocks + "个表格块；其中" + failedBlocks + "个块存在不一致。" + (failures.length ? " 另有" + failures.length + "张表失败。" : "");
+        var headers = ["序号", "工作表", "表格块范围", "边界引用检查数", "不一致数", "状态", "判断依据", "建议"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(5, h + 1).Value2 = headers[h];
+        report.Range("A5:H5").Font.Bold = true;
+        for (var r = 0; r < records.length; r += 1) {
+            var out = 6 + r;
+            var rec = records[r];
+            var vals = [r + 1, rec.sheetName, rec.block, rec.checked, rec.failed, rec.status, "内部已有线按细线核验；外圈不主动加粗；原本整段已粗时允许保留较粗级别。", rec.suggestion];
+            for (var c = 0; c < vals.length; c += 1) report.Cells.Item(out, c + 1).Value2 = vals[c];
+        }
+        var lastRow = Math.max(6, 5 + records.length);
+        report.Range("A5:H" + lastRow).Borders.LineStyle = 1;
+        report.Range("B6:H" + lastRow).WrapText = true;
+        try { report.Range("A5:H" + lastRow).AutoFilter(); } catch (ignored1) {}
+        var widths = [8, 28, 24, 18, 14, 14, 52, 38];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate(); report.Range("A5").Select();
+        工程表清理_安全MsgBox("线宽诊断完成。\n扫描" + sheetNames.length + "张工作表，识别" + totalBlocks + "个表格块，其中" + failedBlocks + "个块需核对。\n详细结果已写入“" + BORDER_DIAGNOSTIC_REPORT_SHEET_NAME + "”。", failedBlocks || failures.length ? JS_EXCLAMATION : JS_INFORMATION, "线宽诊断完成");
+        return report;
+    }
+
+    function createBorderDiagnosticReportByScope(mode) {
+        if (mode === "workbook") return createBorderDiagnosticWorkbookReport();
+        return createBorderDiagnosticReportCurrent();
+    }
+
+    function collectNumberingDiagnosticDetail(sheet) {
+        var result = { rows: [], numericCount: 0, changedCount: 0, chineseCount: 0, status: "" };
+        var bounds = getUsedBounds(sheet);
+        var contentRows = getActualContentRowBounds(sheet, bounds);
+        if (!contentRows) { result.status = "无实际内容"; return result; }
+        var headersFound = findSerialHeaders(sheet, bounds);
+        if (!headersFound.length) { result.status = "未识别到序号/编号/编码列"; return result; }
+        var header = chooseHeaderAutomatically(headersFound, "序号", bounds);
+        if (!header) { result.status = "未能确定序号列"; return result; }
+        var serialColumn = Number(getWritableMergedTopLeft(sheet.Cells.Item(header.row, header.column)).Column);
+        var seenOriginal = {};
+        var items = [];
+        var previousItem = null;
+        for (var row = Number(header.row) + 1; row <= contentRows.lastRow; row += 1) {
+            var source = sheet.Cells.Item(row, serialColumn);
+            if (cellHasFormula(getWritableMergedTopLeft(source))) continue;
+            var parsed = parseNumericSerial(readMergedAwareValue(source));
+            if (!parsed) continue;
+            if (Number(parsed.depth) === 1) seenOriginal = {};
+            var profile = getNumericRowProfile(sheet, row, serialColumn, bounds);
+            var inference = inferNumericSerialLevel(parsed, profile, previousItem, seenOriginal);
+            var item = { row: row, original: parsed.text, parsed: parsed, profile: profile, level: inference.level, smart: inference.smart, reason: inference.reason, expected: "" };
+            items.push(item);
+            previousItem = item;
+            seenOriginal[parsed.parts.join(".")] = true;
+        }
+        buildSmartNumericSerial(items);
+        var chinese = inspectNumberingIssuesOnSheet(sheet).chinese;
+        result.numericCount = items.length;
+        result.chineseCount = chinese.length;
+        for (var i = 0; i < items.length; i += 1) {
+            var current = items[i];
+            if (current.original !== current.expected) result.changedCount += 1;
+            result.rows.push({ type: "数字层级", row: current.row, original: current.original, expected: current.expected, level: current.level, confidence: numberingDiagnosticConfidence(current), reason: current.reason, status: current.original === current.expected ? "通过" : "建议调整" });
+        }
+        for (var c = 0; c < chinese.length; c += 1) {
+            result.rows.push({ type: "中文大项", row: chinese[c].row, original: chinese[c].from, expected: chinese[c].to, level: "—", confidence: "高", reason: "同名内容应使用相同中文序号，名称首次出现才取得下一个序号。", status: "建议调整" });
+        }
+        if (!result.rows.length) result.status = "没有可诊断的数字/中文序号";
+        return result;
+    }
+
+    function createNumberingDiagnosticWorkbookReport() {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, "workbook");
+        var rows = [];
+        var failures = [];
+        var numericCount = 0, changedCount = 0, chineseCount = 0;
+        var maxRows = 20000;
+
+        for (var i = 0; i < sheetNames.length; i += 1) {
+            updateProgress("序号层级诊断", i + 1, sheetNames.length);
+            try {
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
+                var detail = collectNumberingDiagnosticDetail(sheet);
+                numericCount += detail.numericCount;
+                changedCount += detail.changedCount;
+                chineseCount += detail.chineseCount;
+                if (!detail.rows.length) {
+                    rows.push({ sheetName: String(sheet.Name), type: "工作表", row: "—", original: "—", expected: "—", level: "—", confidence: "—", reason: detail.status || "无可诊断序号", status: "跳过/通过" });
+                } else {
+                    for (var d = 0; d < detail.rows.length && rows.length < maxRows; d += 1) {
+                        var item = detail.rows[d];
+                        item.sheetName = String(sheet.Name);
+                        rows.push(item);
+                    }
+                }
+            } catch (error) {
+                failures.push("“" + sheetNames[i] + "”：" + (error && error.message ? error.message : String(error)));
+                rows.push({ sheetName: sheetNames[i], type: "工作表", row: "—", original: "—", expected: "—", level: "—", confidence: "—", reason: "诊断失败", status: "失败" });
+            }
+        }
+
+        restoreActiveSheet(workbook, originalSheetName);
+        deleteReportSheetByName(workbook, NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 11).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(11).Hidden = true; } catch (ignored0) {}
+        report.Range("A1:I1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜序号层级诊断｜整个工作簿";
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A2:I2").Merge();
+        report.Range("A2").Value2 = "与‘数字序号（智能层级）’使用同一推断逻辑，逐张工作表展示判断，不修改原表。";
+        report.Range("A3:I3").Merge();
+        report.Range("A3").Value2 = "扫描" + sheetNames.length + "张工作表；数字序号行" + numericCount + "行，建议调整" + changedCount + "处；中文大项异常" + chineseCount + "处。" + (rows.length >= maxRows ? " 报告已达到" + maxRows + "行上限。" : "") + (failures.length ? " 另有" + failures.length + "张表失败。" : "");
+        var headers = ["工作表", "类型", "行号", "原序号", "建议序号", "推断层级", "置信度", "判断依据", "状态"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(5, h + 1).Value2 = headers[h];
+        report.Range("A5:I5").Font.Bold = true;
+        for (var r = 0; r < rows.length; r += 1) {
+            var out = 6 + r;
+            var rec = rows[r];
+            var vals = [rec.sheetName, rec.type, rec.row, rec.original, rec.expected, rec.level, rec.confidence, rec.reason, rec.status];
+            for (var c = 0; c < vals.length; c += 1) report.Cells.Item(out, c + 1).Value2 = vals[c];
+        }
+        var lastRow = Math.max(6, 5 + rows.length);
+        report.Range("A5:I" + lastRow).Borders.LineStyle = 1;
+        report.Range("A6:I" + lastRow).WrapText = true;
+        try { report.Range("A5:I" + lastRow).AutoFilter(); } catch (ignored1) {}
+        var widths = [28, 14, 10, 16, 16, 12, 12, 58, 16];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Activate(); report.Range("A5").Select();
+        工程表清理_安全MsgBox("序号层级诊断完成。\n扫描" + sheetNames.length + "张工作表；数字序号行" + numericCount + "行，建议调整" + changedCount + "处；中文大项异常" + chineseCount + "处。\n详细结果已写入“" + NUMBERING_DIAGNOSTIC_REPORT_SHEET_NAME + "”。", changedCount || chineseCount || failures.length ? JS_EXCLAMATION : JS_INFORMATION, "序号诊断完成");
+        return report;
+    }
+
+    function createNumberingDiagnosticReportByScope(mode) {
+        if (mode === "workbook") return createNumberingDiagnosticWorkbookReport();
+        return createNumberingDiagnosticReportCurrent();
+    }
+
+    function openMostRecentPluginReport() {
+        var workbook = Application.ActiveWorkbook;
+        if (!workbook) throw new Error("没有活动工作簿。 ");
+        for (var i = workbook.Worksheets.Count; i >= 1; i -= 1) {
+            var sheet = workbook.Worksheets.Item(i);
+            if (!isPluginReportSheet(sheet)) continue;
+            sheet.Activate();
+            try { sheet.Range("A1").Select(); } catch (ignored0) {}
+            return sheet;
+        }
+        工程表清理_安全MsgBox("当前工作簿没有插件生成的报告表。", JS_INFORMATION, "打开最近报告");
+        return null;
+    }
+
+    function isPluginReportSheet(sheet) {
+        var name = "";
+        try { name = String(sheet.Name); } catch (ignored0) {}
+        if (name.indexOf(REPORT_SHEET_PREFIX) === 0) return true;
+        try {
+            return normalizeText(sheet.Cells.Item(1, 10).Value2) === REPORT_MARKER;
+        } catch (ignored1) {
+            return false;
+        }
+    }
+
+    function deletePluginReportSheetsInternal(workbook) {
+        var activeName = "";
+        try { activeName = String(Application.ActiveSheet.Name); } catch (ignored0) {}
+        var activeIsReport = false;
+        try { activeIsReport = isPluginReportSheet(Application.ActiveSheet); } catch (ignored1) {}
+        if (activeIsReport) {
+            for (var s = 1; s <= workbook.Worksheets.Count; s += 1) {
+                var candidate = workbook.Worksheets.Item(s);
+                if (!isPluginReportSheet(candidate) && !isAssistantInternalSheetName(String(candidate.Name))) {
+                    candidate.Activate();
+                    break;
+                }
+            }
+        }
+
+        var deleted = 0;
+        var oldAlerts = Application.DisplayAlerts;
+        try { Application.DisplayAlerts = false; } catch (ignored2) {}
+        try {
+            for (var i = workbook.Worksheets.Count; i >= 1; i -= 1) {
+                var sheet = workbook.Worksheets.Item(i);
+                if (!isPluginReportSheet(sheet)) continue;
+                if (workbook.Worksheets.Count <= 1) break;
+                try {
+                    sheet.Delete();
+                    deleted += 1;
+                } catch (ignored3) {}
+            }
+        } finally {
+            try { Application.DisplayAlerts = oldAlerts; } catch (ignored4) {}
+        }
+        return deleted;
+    }
+
+    function deletePluginReportSheets() {
+        var workbook = Application.ActiveWorkbook;
+        if (!workbook) throw new Error("没有活动工作簿。");
+        var deleted = deletePluginReportSheetsInternal(workbook);
+        工程表清理_安全MsgBox(
+            deleted ? "已删除" + deleted + "张插件生成的报告表。" : "当前工作簿没有插件生成的报告表。",
+            JS_INFORMATION,
+            "删除插件报告表"
+        );
+    }
+
+    function createAuditReportSheet(workbook, scopeLabel, issues, scannedSheets, failures) {
+        deleteReportSheetByName(workbook, AUDIT_REPORT_SHEET_NAME);
+        var report = workbook.Worksheets.Add();
+        report.Name = AUDIT_REPORT_SHEET_NAME;
+        report.Cells.Item(1, 13).Value2 = REPORT_MARKER;
+        try { report.Columns.Item(13).Hidden = true; } catch (ignored0) {}
+
+        var high = 0, medium = 0, hint = 0;
+        for (var c = 0; c < issues.length; c += 1) {
+            var sev = String(issues[c].severity || "");
+            if (sev === "明确" || sev === "高") high += 1;
+            else if (sev === "中") medium += 1;
+            else hint += 1;
+        }
+
+        report.Range("A1:K1").Merge();
+        report.Range("A1").Value2 = "工程表清理助手｜工程表诊断中心｜体检报告";
+        report.Range("A1").Font.Bold = true;
+        report.Range("A1").Font.Size = 16;
+        report.Range("A1").HorizontalAlignment = -4108;
+
+        report.Range("A2:K2").Merge();
+        report.Range("A2").Value2 =
+            "范围：" + scopeLabel + "；扫描工作表：" + scannedSheets +
+            "张；发现问题：" + issues.length + "项（高/明确" + high +
+            "，中" + medium + "，提示" + hint + "）。";
+        report.Range("A2").WrapText = true;
+
+        report.Range("A3:K3").Merge();
+        report.Range("A3").Value2 =
+            "v1.9.2 体检报告与四类专项诊断统一支持当前表/整个工作簿；报告只检查不修改原表。" +
+            (failures.length ? " 另有" + failures.length + "张表检查未完成。" : "");
+        report.Range("A3").WrapText = true;
+
+        var headers = ["序号", "风险等级", "置信度", "工作表", "类别", "位置", "当前状态", "预期状态", "判断依据", "建议处理", "可用功能"];
+        for (var h = 0; h < headers.length; h += 1) report.Cells.Item(5, h + 1).Value2 = headers[h];
+        report.Range("A5:K5").Font.Bold = true;
+        report.Range("A5:K5").HorizontalAlignment = -4108;
+
+        if (!issues.length) {
+            var passRow = [1, "通过", "高", "—", "总体", "—", "未发现已纳入规则的明显问题", "符合当前检查规则", "已执行当前版本体检规则", "仍建议导出前查看打印预览", "—"];
+            for (var p = 0; p < passRow.length; p += 1) report.Cells.Item(6, p + 1).Value2 = passRow[p];
+        } else {
+            for (var i = 0; i < issues.length; i += 1) {
+                var row = 6 + i;
+                var item = issues[i];
+                var values = [
+                    i + 1, item.severity, item.confidence, item.sheetName, item.category,
+                    item.address, item.currentState || item.problem, item.expectedState,
+                    item.basis, item.suggestion, item.action
+                ];
+                for (var j = 0; j < values.length; j += 1) report.Cells.Item(row, j + 1).Value2 = values[j];
+            }
+        }
+
+        var lastRow = Math.max(6, 5 + issues.length);
+        report.Range("A5:K" + lastRow).Borders.LineStyle = 1;
+        report.Range("A5:K" + lastRow).VerticalAlignment = -4160;
+        report.Range("F6:K" + lastRow).WrapText = true;
+        try { report.Range("A5:K" + lastRow).AutoFilter(); } catch (ignored1) {}
+        var widths = [8, 11, 10, 28, 18, 18, 44, 34, 46, 42, 28];
+        for (var w = 0; w < widths.length; w += 1) report.Columns.Item(w + 1).ColumnWidth = widths[w];
+        report.Rows.Item(1).RowHeight = 28;
+        report.Rows.Item(2).RowHeight = 30;
+        report.Rows.Item(3).RowHeight = 34;
+
+        report.Activate();
+        report.Range("A6").Select();
+        return report;
+    }
+
+    function generateEngineeringAuditByScope(mode) {
+        var context = getTargetContext(false);
+        var workbook = context.workbook;
+        var originalSheetName = getOriginalActiveSheetName(workbook);
+        var sheetNames = getScopeSheetNames(workbook, context.sheet, mode);
+        var issues = [];
+        var failures = [];
+
+        for (var i = 0; i < sheetNames.length; i += 1) {
+            updateProgress("工程表体检", i + 1, sheetNames.length);
+            try {
+                var sheet = activateWorksheet(workbook, sheetNames[i]);
+                var sheetName = String(sheet.Name);
+
+                var blankPlan = buildBlankRowCleanupPlan(sheet);
+                if (blankPlan.internalRows.length) {
+                    addAuditIssue(issues, {
+                        severity: "中",
+                        sheetName: sheetName,
+                        category: "空白行",
+                        address: "行" + summarizeRowsCompact(blankPlan.internalRows),
+                        problem: "检测到" + blankPlan.internalRows.length + "行位于实际内容之间的完全空白行。",
+                        suggestion: "确认后清理，避免打印分页和后续数据整理受影响。",
+                        action: "删除完全空白行"
+                    });
+                }
+                if (blankPlan.trailing && blankPlan.trailing.count) {
+                    addAuditIssue(issues, {
+                        severity: "中",
+                        sheetName: sheetName,
+                        category: "尾部模板",
+                        address: "第" + blankPlan.trailing.firstRow + "-" + blankPlan.trailing.lastRow + "行",
+                        problem: "最后实际内容下方仍有" + blankPlan.trailing.count + "行空白模板/格式/打印范围残留。",
+                        suggestion: "清理尾部空白模板并收缩打印范围。",
+                        action: "删除完全空白行"
+                    });
+                }
+
+                var orphanRows = detectOrphanHeaderRows(sheet);
+                if (orphanRows && orphanRows.length) {
+                    addAuditIssue(issues, {
+                        severity: "中",
+                        sheetName: sheetName,
+                        category: "尾页表头",
+                        address: "行" + summarizeRowsCompact(orphanRows),
+                        problem: "检测到可安全合并的短尾页重复表头，共" + orphanRows.length + "行。",
+                        suggestion: "先在分页预览核对，再清理最后一组重复表头。",
+                        action: "清理短尾页表头（可选中）"
+                    });
+                }
+
+                var actual = getActualContentBounds(sheet);
+                if (actual) {
+                    var blocks = detectBorderTableBlocks(sheet, actual);
+                    if (blocks.length) {
+                        var borderCheck = verifyBorderBlocks(sheet, blocks, -4138, 2);
+                        if (borderCheck.failed) {
+                            addAuditIssue(issues, {
+                                severity: "中",
+                                sheetName: sheetName,
+                                category: "表格线宽",
+                                address: "实际表格范围",
+                                problem: "按当前规则核验到" + borderCheck.failed + "条已有边框粗细不一致。",
+                                suggestion: "统一后若仍非0，可再次运行；v1.8.8会按保守线宽规则只补写真正不一致的边界。",
+                                action: "统一外框/内部线宽"
+                            });
+                        }
+                    }
+                }
+
+                var numbering = inspectNumberingIssuesOnSheet(sheet);
+                if (numbering.chinese.length) {
+                    addAuditIssue(issues, {
+                        severity: "提示",
+                        sheetName: sheetName,
+                        category: "中文大项",
+                        address: "行" + summarizeRowsCompact(numbering.chinese.map(function (x) { return x.row; })),
+                        problem: "检测到" + numbering.chinese.length + "处中文大项与“同名同号”规则不一致。",
+                        suggestion: "运行中文大项顺位后重新体检。",
+                        action: "中文大项（同名同号）"
+                    });
+                }
+                if (numbering.numeric.length) {
+                    addAuditIssue(issues, {
+                        severity: "提示",
+                        sheetName: sheetName,
+                        category: "数字序号",
+                        address: "行" + summarizeRowsCompact(numbering.numeric.map(function (x) { return x.row; })),
+                        problem: "检测到" + numbering.numeric.length + "处数字序号与智能层级推断不一致。",
+                        currentState: numbering.numeric.slice(0, 6).map(function (x) { return x.from; }).join("、") + (numbering.numeric.length > 6 ? "…" : ""),
+                        expectedState: numbering.numeric.slice(0, 6).map(function (x) { return x.to; }).join("、") + (numbering.numeric.length > 6 ? "…" : ""),
+                        basis: "与‘数字序号（智能层级）’使用相同的父级存在性、相邻行结构/缩进/粗体/数据列规则。",
+                        suggestion: "先运行序号层级诊断确认判断依据，再决定是否执行智能数字序号顺位。",
+                        action: "序号层级诊断 / 智能数字序号顺位"
+                    });
+                }
+
+                var pdf = inspectPdfRisksOnSheet(sheet);
+                for (var p = 0; p < pdf.issues.length && issues.length < MAX_AUDIT_ISSUES; p += 1) {
+                    var pdfItem = pdf.issues[p];
+                    addAuditIssue(issues, {
+                        severity: pdfItem.severity,
+                        sheetName: pdfItem.sheetName,
+                        category: "PDF/打印",
+                        address: pdfItem.address,
+                        problem: pdfItem.reason,
+                        suggestion: "优先核对打印预览；按问题调整行高、列宽、换行或PrintArea后再次检测。",
+                        action: "PDF文字/打印风险检测"
+                    });
+                }
+            } catch (error) {
+                failures.push("“" + sheetNames[i] + "”：" + (error && error.message ? error.message : String(error)));
+            }
+        }
+
+        restoreActiveSheet(workbook, originalSheetName);
+        var scopeLabel = mode === "workbook" ? "整个工作簿" : "当前工作表";
+        createAuditReportSheet(workbook, scopeLabel, issues, sheetNames.length, failures);
+
+        var high = 0;
+        for (var j = 0; j < issues.length; j += 1) {
+            if (issues[j].severity === "明确" || issues[j].severity === "高") high += 1;
+        }
+        工程表清理_安全MsgBox(
+            "工程表体检完成。\n扫描" + sheetNames.length + "张工作表，发现" + issues.length +
+            "项问题，其中高/明确风险" + high + "项。\n\n已生成“" + AUDIT_REPORT_SHEET_NAME + "”。" +
+            "\n报告表可用【删除插件报告表】一键删除。" +
+            (failures.length ? "\n另有" + failures.length + "张表未完成检查。" : ""),
+            issues.length ? JS_EXCLAMATION : JS_INFORMATION,
+            "工程表体检完成"
+        );
+    }
+
     function showHelp() {
-        MsgBox(
-            "工程表清理助手 v1.8.0\n\n" +
-            "1. 查找并清空文字：可直接输入关键词；默认包含匹配并忽略空格。例如输入第1页，可匹配第 1 页 共 2 页。\n" +
-            "2. 自动重建分页：按后续宽合并表名或连续表格块重建分页，不强制一页宽。\n" +
-            "3. 允许手动拖动：取消按页数缩放，改为100%并打开分页预览。\n" +
-            "4. 线宽统一：共享边界两侧同步写入，并进行最多三轮纠正和最终核验。\n" +
-            "5. PDF风险检测：增加显示文本短于原值、接近右边界、换行高度不足等半字风险。\n" +
-            "6. 普通删行删列只收缩PrintArea，不重置用户手动分页线。\n\n" +
-            "打印布局和内容清除前请保存文件副本。",
+        工程表清理_安全MsgBox(
+            "工程表清理助手 v1.9.2\n\n" +
+            "1. 诊断中心：工程表体检、分页诊断、PDF风险、表格线宽诊断、序号层级诊断都独立显示，并都提供当前工作表/整个工作簿。\n" +
+            "2. 分页诊断：区分WPS自动分页与插件逻辑手动分页；排除工程名称、项目名称以及合计/总计等宽合并非标题行。\n" +
+            "3. 报告处理：可打开最近报告或一键删除所有插件报告表。\n" +
+            "2. 删除插件报告表：只删除名称以“工程表清理_报告_”开头或带插件报告标记的报告表，不删除原工程表。\n" +
+            "3. PDF风险检测：除PrintArea和半字风险外，v1.8.9会直接读取每一行PageBreak，核对实际蓝色分页线，并识别尾页只剩1~4行、或含合计的5~6行短尾页。\n" +
+            "4. 线宽统一：v1.8.8继续使用保守模式——内部已有线统一细线，外圈不再自动加粗；只有原本整段已较粗时才保留较粗级别。\n" +
+            "5. 需要从表格读取标题/文字的功能改用可点选单元格的范围选择框；宏结束后会主动恢复WPS窗口焦点。\n" +
+            "6. 数字序号：升级为智能层级顺位，支持最多4级；当原父级编号不存在时，根据相邻行结构判断同级或子级。\n" +
+            "7. 打印重建：当前表保持稳定路径；整本模式逐张复用当前表范围算法，并直接按Row.PageBreak读取/修正实际蓝色分页线，自动平衡尾页孤行。\n\n" +
+            "体检报告只检查不修改；批量修改前请保存文件副本。",
             JS_INFORMATION,
             "使用说明"
         );
@@ -9318,6 +11912,12 @@ function 工程表清理_内部执行(action, scopeMode) {
     if (action === "allNormalView") return setAllWorksheetViews(1, "普通视图");
     if (action === "normalizeTableBorders") return normalizeTableBordersByScope(scopeMode || "sheet");
     if (action === "detectPdfRisks") return detectPdfRisksByScope(scopeMode || "sheet");
+    if (action === "engineeringAudit") return generateEngineeringAuditByScope(scopeMode || "sheet");
+    if (action === "pageDiagnostic") return createPageDiagnosticReportByScope(scopeMode || "sheet");
+    if (action === "borderDiagnostic") return createBorderDiagnosticReportByScope(scopeMode || "sheet");
+    if (action === "numberingDiagnostic") return createNumberingDiagnosticReportByScope(scopeMode || "sheet");
+    if (action === "openRecentReport") return openMostRecentPluginReport();
+    if (action === "deletePluginReports") return deletePluginReportSheets();
     if (action === "help") return showHelp();
     if (action === "promptDeleteBlankRows") {
         var scope1 = promptScope();
@@ -9353,7 +11953,7 @@ function 工程表清理_安全执行(action, scopeMode) {
         return 工程表清理_内部执行(action, scopeMode);
     } catch (error) {
         var message = error && error.message ? error.message : String(error);
-        MsgBox("操作失败：\n" + message, 48, "工程表清理助手");
+        工程表清理_安全MsgBox("操作失败：\n" + message, 48, "工程表清理助手");
     } finally {
         工程表清理_快速模式结束(fastState);
     }
@@ -9392,6 +11992,16 @@ function 工程表_统一当前表格线宽() { 工程表清理_安全执行("no
 function 工程表_统一整个工作簿线宽() { 工程表清理_安全执行("normalizeTableBorders", "workbook"); }
 function 工程表_PDF风险检测当前表() { 工程表清理_安全执行("detectPdfRisks", "sheet"); }
 function 工程表_PDF风险检测整个工作簿() { 工程表清理_安全执行("detectPdfRisks", "workbook"); }
+function 工程表_体检当前工作表() { 工程表清理_安全执行("engineeringAudit", "sheet"); }
+function 工程表_体检整个工作簿() { 工程表清理_安全执行("engineeringAudit", "workbook"); }
+function 工程表_分页诊断当前表() { 工程表清理_安全执行("pageDiagnostic", "sheet"); }
+function 工程表_分页诊断整个工作簿() { 工程表清理_安全执行("pageDiagnostic", "workbook"); }
+function 工程表_线宽诊断当前表() { 工程表清理_安全执行("borderDiagnostic", "sheet"); }
+function 工程表_线宽诊断整个工作簿() { 工程表清理_安全执行("borderDiagnostic", "workbook"); }
+function 工程表_序号诊断当前表() { 工程表清理_安全执行("numberingDiagnostic", "sheet"); }
+function 工程表_序号诊断整个工作簿() { 工程表清理_安全执行("numberingDiagnostic", "workbook"); }
+function 工程表_打开最近报告() { 工程表清理_安全执行("openRecentReport"); }
+function 工程表_删除插件报告表() { 工程表清理_安全执行("deletePluginReports"); }
 function 工程表_使用说明() { 工程表清理_安全执行("help"); }
 
 /* 功能区回调 */
@@ -9432,4 +12042,17 @@ function RibbonNormalizeBordersCurrent(control) { 工程表清理_安全执行("
 function RibbonNormalizeBordersWorkbook(control) { 工程表清理_安全执行("normalizeTableBorders", "workbook"); }
 function RibbonDetectPdfCurrent(control) { 工程表清理_安全执行("detectPdfRisks", "sheet"); }
 function RibbonDetectPdfWorkbook(control) { 工程表清理_安全执行("detectPdfRisks", "workbook"); }
+function RibbonAuditCurrent(control) { 工程表清理_安全执行("engineeringAudit", "sheet"); }
+function RibbonAuditWorkbook(control) { 工程表清理_安全执行("engineeringAudit", "workbook"); }
+function RibbonPageDiagnostic(control) { 工程表清理_安全执行("pageDiagnostic", "sheet"); }
+function RibbonPageDiagnosticCurrent(control) { 工程表清理_安全执行("pageDiagnostic", "sheet"); }
+function RibbonPageDiagnosticWorkbook(control) { 工程表清理_安全执行("pageDiagnostic", "workbook"); }
+function RibbonBorderDiagnostic(control) { 工程表清理_安全执行("borderDiagnostic", "sheet"); }
+function RibbonBorderDiagnosticCurrent(control) { 工程表清理_安全执行("borderDiagnostic", "sheet"); }
+function RibbonBorderDiagnosticWorkbook(control) { 工程表清理_安全执行("borderDiagnostic", "workbook"); }
+function RibbonNumberingDiagnostic(control) { 工程表清理_安全执行("numberingDiagnostic", "sheet"); }
+function RibbonNumberingDiagnosticCurrent(control) { 工程表清理_安全执行("numberingDiagnostic", "sheet"); }
+function RibbonNumberingDiagnosticWorkbook(control) { 工程表清理_安全执行("numberingDiagnostic", "workbook"); }
+function RibbonOpenRecentReport(control) { 工程表清理_安全执行("openRecentReport"); }
+function RibbonDeletePluginReports(control) { 工程表清理_安全执行("deletePluginReports"); }
 function RibbonShowHelp(control) { 工程表清理_安全执行("help"); }

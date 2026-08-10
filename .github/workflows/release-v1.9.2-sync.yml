@@ -18,10 +18,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .release_tmp/js2_*.b64 | base64 -d | gzip -d > src/EngineeringTableCleaner.js
+          cat .release_tmp/js_gz_*.b64 | base64 -d | gzip -d > src/EngineeringTableCleaner.js
           echo 'eee164cc2ed33a5872aa815557eeb3ce2e0a15a974f3a77bfd31b99b6b01a201  src/EngineeringTableCleaner.js' | sha256sum -c -
           mkdir -p release
-          cat .release_tmp/xlam2_*.b64 | base64 -d > 'release/工程表清理助手_v1.9.2.xlam'
+          cat .release_tmp/xlam_*.b64 | base64 -d > 'release/工程表清理助手_v1.9.2.xlam'
           echo '1e5d253d1bfe8b0b2a35fc14f525a2082a3541a3fff9e07e064350e33fab4867  release/工程表清理助手_v1.9.2.xlam' | sha256sum -c -
           node --check src/EngineeringTableCleaner.js
           rm -rf .release_tmp
